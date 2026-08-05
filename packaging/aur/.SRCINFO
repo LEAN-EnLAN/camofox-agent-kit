@@ -1,6 +1,6 @@
 pkgbase = camofox-browser-service
 	pkgdesc = systemd user service, MCP registration and agent skill for camofox-browser (anti-detection browser for AI agents)
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/LEAN-EnLAN/camofox-agent-kit
 	install = camofox-browser-service.install
@@ -23,7 +23,7 @@ pkgbase = camofox-browser-service
 	depends = dbus-glib
 	optdepends = camofox-browser-bin: the REST server and bundled Camoufox binary (otherwise install @askjo/camofox-browser via npm)
 	optdepends = yt-dlp: YouTube transcript extraction
-	source = camofox-browser-service-0.1.0.tar.gz::https://github.com/LEAN-EnLAN/camofox-agent-kit/archive/refs/tags/v0.1.0.tar.gz
+	source = camofox-browser-service-0.1.1.tar.gz::https://github.com/LEAN-EnLAN/camofox-agent-kit/archive/refs/tags/v0.1.1.tar.gz
 	sha256sums = SKIP
 
 pkgname = camofox-browser-service
