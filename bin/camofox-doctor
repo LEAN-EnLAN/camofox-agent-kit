@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# camofox-doctor — one command that answers "why isn't the browser working?"
+#
+# Checks the whole chain an agent tool call travels: binary → service → port →
+# health → MCP registration. Exits non-zero if anything is broken so it can be
+# used in scripts.
+#
+set -uo pipefail
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YEL=$'\033[33m'
+else
+  R=''; B=''; D=''; RED=''; GREEN=''; YEL=''
+fi
+
+FAIL=0
+pass() { printf '%s  ✔%s %s\n' "$GREEN" "$R" "$*"; }
+fail() { printf '%s  ✘%s %s\n' "$RED" "$R" "$*"; FAIL=1; }
+note() { printf '%s  ~%s %s\n' "$YEL" "$R" "$*"; }
+hint() { printf '%s      %s%s\n' "$D" "$*" "$R"; }
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+ENV_FILE="$XDG_CONFIG_HOME/camofox-browser/camofox-browser.env"
+UNIT=camofox-browser.service
+
+# Read the effective config from the env file the service actually loads.
+read_env() {
+  local key="$1" default="$2" val=""
+  [ -f "$ENV_FILE" ] && val="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)"
+  printf '%s\n' "${val:-$default}"
+}
+
+PORT="$(read_env CAMOFOX_PORT 9377)"
+BIND="$(read_env CAMOFOX_BIND_HOST 127.0.0.1)"
+ACCESS_KEY="$(read_env CAMOFOX_ACCESS_KEY '')"
+BASE_URL="http://${BIND}:${PORT}"
+
+printf '%scamofox-doctor%s  %s\n\n' "$B" "$R" "$BASE_URL"
+
+# --- 1. runtime ------------------------------------------------------------
+printf '%sRuntime%s\n' "$B" "$R"
+if command -v node >/dev/null 2>&1; then
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [ "$major" -ge 22 ] 2>/dev/null; then pass "node $(node -v)"; else fail "node $(node -v) — need >= 22"; fi
+else
+  fail "node not found"
+fi
+
+for bin in camofox-browser camofox-browser-mcp; do
+  if command -v "$bin" >/dev/null 2>&1; then pass "$bin → $(command -v "$bin")"
+  else fail "$bin not on PATH"; hint "npm install -g @askjo/camofox-browser @askjo/camofox-browser-mcp"; fi
+done
+
+if [ -d "$XDG_CACHE_HOME/camoufox/browsers" ] || [ -f "$XDG_CACHE_HOME/camoufox/version.json" ]; then
+  pass "Camoufox binary cached ($(du -sh "$XDG_CACHE_HOME/camoufox" 2>/dev/null | cut -f1))"
+else
+  fail "Camoufox browser binary missing"; hint "npx camoufox-js fetch"
+fi
+
+if command -v pacman >/dev/null 2>&1; then
+  missing=()
+  for p in gtk3 alsa-lib nss nspr libxtst libxcomposite libxfixes libxrandr libxrender libxcursor libxi dbus-glib; do
+    pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then pass "shared libraries present"
+  else fail "missing libraries: ${missing[*]}"; hint "sudo pacman -S --needed ${missing[*]}"; fi
+fi
+
+# --- 2. service ------------------------------------------------------------
+printf '\n%sService%s\n' "$B" "$R"
+if [ -f "$XDG_CONFIG_HOME/systemd/user/$UNIT" ]; then
+  pass "unit installed"
+  state="$(systemctl --user is-active "$UNIT" 2>/dev/null || true)"
+  if [ "$state" = "active" ]; then pass "active"
+  else fail "not active (state: ${state:-unknown})"; hint "journalctl --user -u $UNIT -n 40 --no-pager"; fi
+  if systemctl --user is-enabled "$UNIT" >/dev/null 2>&1; then pass "enabled at login"
+  else note "not enabled"; hint "systemctl --user enable $UNIT"; fi
+  if loginctl show-user "$(whoami)" -p Linger --value 2>/dev/null | grep -q yes; then
+    pass "user lingering enabled (survives logout)"
+  else
+    note "no lingering — the service stops when you log out"
+    hint "sudo loginctl enable-linger $(whoami)"
+  fi
+else
+  note "no systemd unit — running the server manually?"
+fi
+
+# --- 3. reachability -------------------------------------------------------
+printf '\n%sReachability%s\n' "$B" "$R"
+if [ -f "$ENV_FILE" ]; then pass "config $ENV_FILE"; else note "no config file at $ENV_FILE (defaults in use)"; fi
+
+case "$BIND" in
+  127.0.0.1|localhost|::1) pass "bound to loopback" ;;
+  ""|0.0.0.0|"*")
+    if [ -n "$ACCESS_KEY" ]; then note "listening on all interfaces, but CAMOFOX_ACCESS_KEY is set"
+    else fail "listening on ALL interfaces with no CAMOFOX_ACCESS_KEY"
+         hint "anyone who can reach :$PORT can drive your browser with your cookies"
+         hint "set CAMOFOX_BIND_HOST=127.0.0.1 in $ENV_FILE"; fi ;;
+  *) note "bound to $BIND" ;;
+esac
+
+AUTH=()
+[ -n "$ACCESS_KEY" ] && AUTH=(-H "Authorization: Bearer $ACCESS_KEY")
+if body="$(curl -fsS --max-time 5 "${AUTH[@]}" "$BASE_URL/health" 2>/dev/null)"; then
+  pass "GET /health → ok"
+  if command -v node >/dev/null 2>&1; then
+    printf '%s      %s%s\n' "$D" "$(printf '%s' "$body" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{const j=JSON.parse(s);console.log(Object.entries(j).slice(0,6).map(([k,v])=>`${k}=${typeof v==="object"?JSON.stringify(v):v}`).join(" "))}catch{console.log(s.slice(0,160))}})' 2>/dev/null)" "$R"
+  fi
+else
+  fail "GET $BASE_URL/health failed"
+  hint "systemctl --user restart $UNIT"
+fi
+
+# --- 4. MCP registration ---------------------------------------------------
+printf '\n%sAgent hosts%s\n' "$B" "$R"
+check_host() {
+  local label="$1" path="$2" needle="$3"
+  if [ ! -e "$path" ]; then printf '%s  –%s %s not installed\n' "$D" "$R" "$label"; return; fi
+  if grep -q "$needle" "$path" 2>/dev/null; then pass "$label registered"
+  else note "$label installed but camofox not registered"; hint "re-run ./install.sh"; fi
+}
+check_host "Claude Code" "$HOME/.claude.json"                        '"camofox-browser"'
+check_host "Codex CLI"   "$HOME/.codex/config.toml"                  'mcp_servers.camofox-browser'
+check_host "Cursor"      "$HOME/.cursor/mcp.json"                    '"camofox-browser"'
+check_host "opencode"    "$XDG_CONFIG_HOME/opencode/opencode.json"   '"camofox-browser"'
+check_host "agy"         "$HOME/.gemini/config/mcp_config.json"      '"camofox-browser"'
+
+if [ -f "$HOME/.claude/skills/camofox-browser/SKILL.md" ]; then pass "Claude Code skill installed"
+else note "Claude Code skill not installed"; fi
+
+echo
+if [ "$FAIL" -eq 0 ]; then
+  printf '%s%sAll good.%s\n' "$GREEN" "$B" "$R"
+else
+  printf '%s%sProblems found — see the ✘ lines above.%s\n' "$RED" "$B" "$R"
+fi
+exit "$FAIL"

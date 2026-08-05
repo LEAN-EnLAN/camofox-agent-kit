@@ -1,0 +1,90 @@
+# Maintainer: LEAN-EnLAN <lpalombo@zafirus.tech>
+#
+# camofox-browser-service — the systemd integration that camofox-browser and the
+# existing AUR packages do not ship.
+#
+# Deliberately does NOT package the server or the ~1.3GB browser binary: that is
+# camofox-browser-bin's job (or npm's). This package is the missing glue —
+# a hardened systemd user unit bound to loopback, a documented EnvironmentFile,
+# the agent skill, and the camofox-doctor health checker.
+#
+# Note on scope: it installs the *system-wide* unit template and skill. MCP host
+# registration stays a per-user action (`camofox-kit-register`) because it edits
+# files under $HOME that pacman must never own.
+
+pkgname=camofox-browser-service
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="systemd user service, MCP registration and agent skill for camofox-browser (anti-detection browser for AI agents)"
+arch=('any')
+url="https://github.com/LEAN-EnLAN/camofox-agent-kit"
+license=('MIT')
+depends=('nodejs>=22' 'systemd' 'curl')
+optdepends=(
+  'camofox-browser-bin: the REST server and bundled Camoufox binary (otherwise install @askjo/camofox-browser via npm)'
+  'yt-dlp: YouTube transcript extraction'
+)
+# Runtime libraries the Camoufox (Firefox) binary dlopens. Missing any of these
+# yields "browser failed to launch" at the first tab, not at install time.
+depends+=('gtk3' 'alsa-lib' 'nss' 'nspr' 'libxtst' 'libxcomposite' 'libxfixes'
+          'libxrandr' 'libxrender' 'libxcursor' 'libxi' 'dbus-glib')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+install="$pkgname.install"
+
+package() {
+  cd "$srcdir/camofox-agent-kit-$pkgver"
+
+  # System-wide user-unit template. `systemctl --user enable camofox-browser`
+  # picks it up for any user, no per-user copy needed.
+  #
+  # The in-repo unit carries __EXEC__/__PATH__ placeholders that install.sh
+  # substitutes per user. A packaged unit cannot know the user's node prefix, so
+  # it resolves through PATH and relies on the packaged bin instead.
+  install -dm755 "$pkgdir/usr/lib/systemd/user"
+  sed -e 's|^ExecStart=__EXEC__$|ExecStart=/usr/bin/camofox-browser|' \
+      -e 's|^Environment=PATH=__PATH__$|Environment=PATH=/usr/local/bin:/usr/bin:/bin|' \
+      systemd/camofox-browser.service \
+      > "$pkgdir/usr/lib/systemd/user/camofox-browser.service"
+
+  # Reference config. The unit reads %h/.config/... — this is the template a
+  # user copies, so pacman upgrades never touch live configuration.
+  install -Dm644 systemd/camofox-browser.env.example \
+    "$pkgdir/usr/share/$pkgname/camofox-browser.env.example"
+
+  install -Dm755 bin/camofox-doctor "$pkgdir/usr/bin/camofox-doctor"
+
+  # Per-user MCP host registration, exposed as a command rather than run at
+  # install time: it writes under $HOME, which a package must not do.
+  install -Dm644 lib/register-mcp.mjs \
+    "$pkgdir/usr/share/$pkgname/register-mcp.mjs"
+  install -dm755 "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/camofox-kit-register" <<'EOF'
+#!/bin/sh
+# Register the camofox-browser MCP server in this user's agent hosts.
+# Pass through any flag of register-mcp.mjs (--remove, --dry-run, --all, ...).
+set -e
+BIN="$(command -v camofox-browser-mcp || true)"
+if [ -z "$BIN" ]; then
+  echo "camofox-browser-mcp not found on PATH." >&2
+  echo "Install it with: npm install -g @askjo/camofox-browser-mcp" >&2
+  exit 1
+fi
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/camofox-browser/camofox-browser.env"
+PORT=9377; HOST=127.0.0.1
+if [ -f "$CONF" ]; then
+  P=$(grep -E '^CAMOFOX_PORT=' "$CONF" | tail -1 | cut -d= -f2-); [ -n "$P" ] && PORT="$P"
+  H=$(grep -E '^CAMOFOX_BIND_HOST=' "$CONF" | tail -1 | cut -d= -f2-); [ -n "$H" ] && HOST="$H"
+fi
+exec node /usr/share/camofox-browser-service/register-mcp.mjs \
+  --bin "$BIN" --base-url "http://$HOST:$PORT" "$@"
+EOF
+  chmod 755 "$pkgdir/usr/bin/camofox-kit-register"
+
+  install -Dm644 skills/camofox-browser/SKILL.md \
+    "$pkgdir/usr/share/$pkgname/skills/camofox-browser/SKILL.md"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 AGENTS.md "$pkgdir/usr/share/doc/$pkgname/AGENTS.md"
+}

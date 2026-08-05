@@ -1,0 +1,60 @@
+post_install() {
+  cat <<'EOF'
+
+camofox-browser-service installed. Three per-user steps remain — none of them
+can be done by a package, because they write under $HOME:
+
+  1. Config (bound to loopback by default — keep it that way):
+       install -Dm600 /usr/share/camofox-browser-service/camofox-browser.env.example \
+         ~/.config/camofox-browser/camofox-browser.env
+
+  2. Service:
+       systemctl --user enable --now camofox-browser
+       sudo loginctl enable-linger "$USER"    # survive logout
+
+  3. Agent hosts + skill:
+       camofox-kit-register
+       install -Dm644 /usr/share/camofox-browser-service/skills/camofox-browser/SKILL.md \
+         ~/.claude/skills/camofox-browser/SKILL.md
+
+The REST server itself is NOT in this package. Install one of:
+       camofox-browser-bin            (AUR, bundles the browser binary)
+       npm install -g @askjo/camofox-browser @askjo/camofox-browser-mcp
+
+Then verify the whole chain:
+       camofox-doctor
+
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+
+The unit template was replaced. Reload and restart:
+       systemctl --user daemon-reload
+       systemctl --user restart camofox-browser
+
+Your ~/.config/camofox-browser/camofox-browser.env was not touched. Compare it
+with /usr/share/camofox-browser-service/camofox-browser.env.example for new keys.
+
+EOF
+}
+
+pre_remove() {
+  # Best-effort: a scriptlet runs as root and cannot reach every user's manager.
+  systemctl --user --global disable camofox-browser.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  cat <<'EOF'
+
+Removed. Left behind on purpose:
+       ~/.config/camofox-browser/     config, possibly with keys
+       ~/.cache/camoufox/             browser binary (~1.3GB)
+       ~/.camofox/                    sessions, cookies, storage state
+
+MCP host entries stay registered until you run:
+       camofox-kit-register --remove   (before removing the package)
+
+EOF
+}

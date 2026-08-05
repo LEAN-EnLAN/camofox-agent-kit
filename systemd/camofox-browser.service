@@ -1,0 +1,57 @@
+[Unit]
+# camofox-browser — anti-detection browser server for AI agents.
+# Installed as a systemd *user* unit: the browser runs as you, reads your
+# ~/.cache/camoufox binary, and writes sessions under your $HOME. Running it as
+# a system unit would need a dedicated user and buys nothing for a single-seat
+# workstation.
+Description=camofox-browser — anti-detection browser server for AI agents
+Documentation=https://github.com/jo-inc/camofox-browser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Placeholders are substituted by install.sh at install time.
+#   __EXEC__     absolute path to the camofox-browser bin
+#   __PATH__     PATH including the directory of the active node binary
+ExecStart=__EXEC__
+
+# systemd user units start from a minimal PATH that excludes nvm/fnm/volta
+# shims, so the `#!/usr/bin/env node` shebang would fail to resolve without this.
+Environment=PATH=__PATH__
+Environment=NODE_ENV=production
+
+# Operator-owned settings live here so upgrades never clobber them.
+EnvironmentFile=-%h/.config/camofox-browser/camofox-browser.env
+
+Restart=on-failure
+RestartSec=5s
+# Give up after 5 failures in 60s instead of hammering a broken install.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# The browser is launched lazily and torn down when idle, so startup is fast but
+# the first tab after an idle period pays the launch cost.
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camofox-browser
+
+# --- Hardening -------------------------------------------------------------
+# Deliberately conservative. Firefox needs unprivileged user namespaces for its
+# own content sandbox, so the aggressive knobs (PrivateUsers, RestrictNamespaces,
+# SystemCallFilter, ProtectHome) break tab creation rather than secure it.
+# The meaningful boundary for this service is the listen address, enforced via
+# CAMOFOX_BIND_HOST in the env file — not a syscall filter.
+NoNewPrivileges=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=default.target
