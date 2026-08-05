@@ -13,7 +13,7 @@
 # files under $HOME that pacman must never own.
 
 pkgname=camofox-browser-service
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="systemd user service, MCP registration and agent skill for camofox-browser (anti-detection browser for AI agents)"
 arch=('any')

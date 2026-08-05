@@ -9,6 +9,11 @@ Documentation=https://github.com/jo-inc/camofox-browser
 After=network-online.target
 Wants=network-online.target
 
+# Give up after 5 failed starts in 60s instead of hammering a broken install.
+# These belong in [Unit], not [Service] — systemd silently ignores them there.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
 [Service]
 Type=simple
 
@@ -27,9 +32,6 @@ EnvironmentFile=-%h/.config/camofox-browser/camofox-browser.env
 
 Restart=on-failure
 RestartSec=5s
-# Give up after 5 failures in 60s instead of hammering a broken install.
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 # The browser is launched lazily and torn down when idle, so startup is fast but
 # the first tab after an idle period pays the launch cost.
