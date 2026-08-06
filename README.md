@@ -38,6 +38,8 @@ node test/mcp-e2e.mjs     # stdio MCP → REST → Camoufox → a real page
 | **MCP everywhere** | Registered in Claude Code, Codex CLI, Cursor, opencode and Antigravity/agy — whichever it finds |
 | **A skill** | Tells agents to use `camofox_*` instead of installing Playwright, and how to drive it without wasting loops |
 | **A doctor** | `camofox-doctor` walks binary → service → port → health → registration and tells you which link is broken |
+| **Headless capture** | `agent-capture` — screenshots and video that work with **no display at all**, via a throwaway virtual display |
+| **A subagent** | `web-operator`, pre-loaded with both tools, so delegated browser work doesn't reinvent it |
 | **An Arch package** | [`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) for pacman-managed lifecycle |
 
 ## Why not Playwright or Puppeteer
@@ -77,6 +79,59 @@ Camoufox (Firefox fork)      ~/.cache/camoufox, launched lazily
 The MCP adapter carries no browser dependencies — it is a stdio-to-REST
 translator. One server process serves every agent session, so the ~300MB browser
 is launched once, not once per agent.
+
+## Seeing and showing the work: `agent-capture`
+
+Page screenshots come from camofox. Everything else — a native app, a TUI, a
+whole desktop, a video, a GIF for a PR — comes from `agent-capture`, which picks
+its backend from the environment instead of making you care:
+
+| Environment | Screenshot | Video |
+|---|---|---|
+| Headed Wayland (Hyprland, Sway, GNOME) | `grim` | `wf-recorder` |
+| Headed X11 / Xwayland | `ffmpeg x11grab` | `ffmpeg x11grab` |
+| **No display at all** | virtual display (`Xvfb`) + `ffmpeg` | same |
+
+```bash
+agent-capture doctor                    # what works here, and how to fix what doesn't
+agent-capture shot -o before.png
+agent-capture rec start -o demo.mp4     # ... work ...
+agent-capture rec stop
+agent-capture gif demo.mp4 --width 800
+
+# headless: no screen, no compositor, no logged-in user
+agent-capture run --shot out.png    -- firefox --new-window https://example.com
+agent-capture run --record demo.mp4 -- ./my-electron-app
+```
+
+Two behaviours worth knowing, because both are silent failures elsewhere:
+
+- **It refuses to hand back a blank image.** A capture that is one flat colour
+  exits non-zero. On a Wayland session, grabbing X11 `:0` returns a black frame
+  with a stray cursor (Xwayland's root is not the composited desktop) — verified
+  on Hyprland. Reporting that as a successful screenshot is worse than failing.
+- **`rec stop` sends SIGINT, not SIGKILL**, so the container trailer is written
+  and the video is actually playable.
+
+## Subagents that already know the tools
+
+A delegated agent inherits none of the caller's reasoning — point a naive
+subagent at a browser task and it will `npm install playwright`. So the kit
+installs a subagent definition with the knowledge baked in:
+
+```
+~/.claude/agents/web-operator.md
+```
+
+`web-operator` knows camofox (including the REST fallback, for when a subagent
+does not inherit MCP servers), knows `agent-capture`, knows the failure
+signatures, and is told to open every image it captures rather than reporting
+screenshots it never looked at.
+
+```
+> Use the web-operator subagent to check whether the login page renders
+> correctly on the staging deploy and attach a screenshot.
+```
 
 ## Configure
 

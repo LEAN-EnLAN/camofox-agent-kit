@@ -58,10 +58,18 @@ else
   warn "node not found; remove the camofox-browser MCP entry from your host configs by hand"
 fi
 
-log "Agent skill"
-SKILL_DEST="$HOME/.claude/skills/camofox-browser"
-if [ -d "$SKILL_DEST" ]; then rm -rf "$SKILL_DEST"; ok "removed $SKILL_DEST"; else info "no skill installed"; fi
-rm -f "$HOME/.local/bin/camofox-doctor" && ok "removed camofox-doctor"
+log "Agent skills and subagents"
+for skill in camofox-browser agent-capture; do
+  dest="$HOME/.claude/skills/$skill"
+  if [ -d "$dest" ]; then rm -rf "$dest"; ok "removed $dest"; fi
+done
+for agent_file in "$SCRIPT_DIR"/agents/*.md; do
+  [ -e "$agent_file" ] || continue
+  dest="$HOME/.claude/agents/$(basename "$agent_file")"
+  if [ -f "$dest" ]; then rm -f "$dest"; ok "removed $dest"; fi
+done
+rm -f "$HOME/.local/bin/camofox-doctor" "$HOME/.local/bin/agent-capture" && ok "removed camofox-doctor and agent-capture"
+info "capture packages (xvfb/ffmpeg/grim/...) are left installed — remove with pacman if you want"
 
 if [ "$KEEP_PACKAGES" = "0" ]; then
   log "Packages"

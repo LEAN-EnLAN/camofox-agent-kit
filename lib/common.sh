@@ -81,6 +81,27 @@ npm_prefix() {
 # produces an opaque "browser failed to launch" at the first tab, not at install.
 ARCH_RUNTIME_DEPS=(gtk3 alsa-lib nss nspr libxtst libxcomposite libxfixes libxrandr libxrender libxcursor libxi dbus-glib)
 
+# Packages that make agent-capture work. Split from ARCH_RUNTIME_DEPS because
+# these are about capturing a screen, not about launching the browser — a box
+# that only needs headless page screenshots does not need any of them.
+#   xorg-server-xvfb  the virtual display; without it there is NO headless capture
+#   ffmpeg            records any X display, and converts to GIF
+#   grim/slurp        Wayland screenshots and region select
+#   wf-recorder       Wayland video
+#   xdotool           synthetic input inside a virtual display
+#   imagemagick       crop/annotate, and the blank-image check
+#   xorg-xdpyinfo     display geometry (ffmpeg needs an explicit -video_size)
+CAPTURE_DEPS=(xorg-server-xvfb ffmpeg grim slurp wf-recorder xdotool imagemagick xorg-xdpyinfo)
+
+missing_capture_deps() {
+  local missing=() p
+  for p in "${CAPTURE_DEPS[@]}"; do
+    pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  [ "${#missing[@]}" -eq 0 ] && return 0
+  printf '%s\n' "${missing[@]}"
+}
+
 missing_arch_deps() {
   local missing=() p
   for p in "${ARCH_RUNTIME_DEPS[@]}"; do
@@ -89,6 +110,28 @@ missing_arch_deps() {
   # Print nothing at all when complete, so callers can use a plain line count.
   [ "${#missing[@]}" -eq 0 ] && return 0
   printf '%s\n' "${missing[@]}"
+}
+
+# pacman_install <pkg>... — install without ever aborting the caller.
+# sudo may need a password that a non-interactive run cannot supply; that is a
+# step the user can finish in one command, not a reason to abandon the install.
+pacman_install() {
+  [ $# -gt 0 ] || return 0
+  if [ "$(id -u)" = "0" ]; then
+    pacman -S --needed --noconfirm "$@" && return 0
+    return 1
+  fi
+  have sudo || { warn "sudo not found"; return 1; }
+  if sudo -n true 2>/dev/null; then
+    sudo pacman -S --needed --noconfirm "$@" && return 0
+    return 1
+  fi
+  if [ -t 0 ]; then
+    sudo pacman -S --needed "$@" && return 0
+    return 1
+  fi
+  warn "sudo needs a password and this shell is not interactive"
+  return 1
 }
 
 # ---------------------------------------------------------------------------

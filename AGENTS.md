@@ -34,13 +34,21 @@ It will:
    then wait for `/health`.
 5. Register the MCP server in each detected host: Claude Code, Codex CLI, Cursor,
    opencode, Antigravity/agy.
-6. Install the `camofox-browser` skill into `~/.claude/skills/`.
-7. Install `camofox-doctor` into `~/.local/bin/`.
+6. Install the `camofox-browser` and `agent-capture` skills into
+   `~/.claude/skills/`, and the `web-operator` subagent into `~/.claude/agents/`.
+7. Install `camofox-doctor` and `agent-capture` into `~/.local/bin/`.
+
+Screen-capture packages (`xorg-server-xvfb`, `wf-recorder`, `xdotool`,
+`xorg-xdpyinfo`) are **optional**: skipping them costs screen capture, not the
+browser. If the installer cannot get sudo it prints the exact `pacman` line and
+continues — relay that line to the user rather than retrying.
 
 ## Verify
 
 ```bash
-camofox-doctor
+camofox-doctor          # browser chain
+agent-capture doctor    # capture backends, headed and headless
+node test/mcp-e2e.mjs   # stdio MCP → REST → Camoufox, against a live page
 ```
 
 Every line must be `✔`. Then **tell the user to restart their agent CLI** — MCP

@@ -89,6 +89,7 @@ case "$PORT" in ''|*[!0-9]*) die "--port must be a number, got '$PORT'" ;; esac
 BASE_URL="http://${BIND_HOST}:${PORT}"
 CORE_BIN_PATH=""
 MCP_BIN_PATH=""
+CAPTURE_HINT=""
 
 printf '%s\n' "${C_BOLD}camofox-agent-kit${C_RESET} — installing for $(whoami) on $(uname -sr)"
 echo
@@ -117,13 +118,46 @@ if [ "$DO_DEPS" = "1" ]; then
     warn "missing Camoufox runtime libraries: ${MISSING[*]}"
     info "without these the server starts fine but every tab fails to launch"
     if confirm "Install them with pacman now?"; then
-      sudo pacman -S --needed --noconfirm "${MISSING[@]}"
-      ok "runtime libraries installed"
+      # Never fatal: sudo may need a password we cannot prompt for (non-interactive
+      # run, no askpass). Aborting here would leave the user with nothing installed
+      # over a step they can complete themselves in one command.
+      if pacman_install "${MISSING[@]}"; then
+        ok "runtime libraries installed"
+      else
+        warn "could not install them automatically — run this yourself:"
+        warn "  sudo pacman -S --needed ${MISSING[*]}"
+      fi
     else
       warn "continuing without them — expect 'browser failed to launch' on first use"
     fi
   else
     ok "Camoufox runtime libraries present"
+  fi
+
+  # agent-capture's dependencies. Optional by design: skipping them costs you
+  # screen capture, not the browser. Xvfb is the one that matters — without it
+  # there is no headless capture path at all.
+  CAP_MISSING=()
+  mapfile -t CAP_MISSING < <(missing_capture_deps)
+  if [ "${#CAP_MISSING[@]}" -gt 0 ]; then
+    warn "agent-capture is missing: ${CAP_MISSING[*]}"
+    case " ${CAP_MISSING[*]} " in
+      *" xorg-server-xvfb "*) info "without xorg-server-xvfb there is NO headless screenshot/recording path" ;;
+    esac
+    if confirm "Install the screen-capture dependencies with pacman?"; then
+      if pacman_install "${CAP_MISSING[@]}"; then
+        ok "capture dependencies installed"
+      else
+        warn "could not install them automatically — run this yourself:"
+        warn "  sudo pacman -S --needed ${CAP_MISSING[*]}"
+        CAPTURE_HINT="sudo pacman -S --needed ${CAP_MISSING[*]}"
+      fi
+    else
+      warn "skipped — 'agent-capture doctor' will show what is still missing"
+      CAPTURE_HINT="sudo pacman -S --needed ${CAP_MISSING[*]}"
+    fi
+  else
+    ok "screen-capture dependencies present"
   fi
 fi
 
@@ -268,24 +302,45 @@ if [ "$DO_MCP" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Skill
+# 6. Skills and subagents
 # ---------------------------------------------------------------------------
 if [ "$DO_SKILL" = "1" ]; then
-  log "Agent skill"
-  SKILL_DEST="$HOME/.claude/skills/camofox-browser"
-  mkdir -p "$SKILL_DEST"
-  sed -e "s|__BASE_URL__|$BASE_URL|g" \
-      -e "s|__UNIT__|$KIT_UNIT_NAME|g" \
-      "$SCRIPT_DIR/skills/camofox-browser/SKILL.md" > "$SKILL_DEST/SKILL.md"
-  ok "installed skill → $SKILL_DEST/SKILL.md"
+  log "Agent skills"
+  for skill_src in "$SCRIPT_DIR"/skills/*/SKILL.md; do
+    [ -e "$skill_src" ] || continue
+    skill_name="$(basename "$(dirname "$skill_src")")"
+    skill_dest="$HOME/.claude/skills/$skill_name"
+    mkdir -p "$skill_dest"
+    # Placeholders let the installed copy name this machine's real endpoints
+    # instead of telling agents to guess them.
+    sed -e "s|__BASE_URL__|$BASE_URL|g" \
+        -e "s|__UNIT__|$KIT_UNIT_NAME|g" \
+        "$skill_src" > "$skill_dest/SKILL.md"
+    ok "skill $skill_name → $skill_dest/SKILL.md"
+  done
+
+  # Subagent definitions. A delegated agent inherits none of the caller's
+  # reasoning, so the tooling knowledge has to live in its own definition or it
+  # will reach for Playwright like any uninformed agent would.
+  if [ -d "$SCRIPT_DIR/agents" ]; then
+    mkdir -p "$HOME/.claude/agents"
+    for agent_src in "$SCRIPT_DIR"/agents/*.md; do
+      [ -e "$agent_src" ] || continue
+      install -Dm644 "$agent_src" "$HOME/.claude/agents/$(basename "$agent_src")"
+      ok "subagent $(basename "$agent_src" .md) → ~/.claude/agents/"
+    done
+  fi
   info "other hosts: point their instruction file at AGENTS.md in this repo"
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Doctor
+# 7. Commands
 # ---------------------------------------------------------------------------
+log "Commands"
 install -Dm755 "$SCRIPT_DIR/bin/camofox-doctor" "$HOME/.local/bin/camofox-doctor"
-ok "installed camofox-doctor → ~/.local/bin/camofox-doctor"
+ok "camofox-doctor → ~/.local/bin/camofox-doctor"
+install -Dm755 "$SCRIPT_DIR/bin/agent-capture" "$HOME/.local/bin/agent-capture"
+ok "agent-capture → ~/.local/bin/agent-capture"
 
 echo
 printf '%s\n' "${C_GREEN}${C_BOLD}Done.${C_RESET}"
@@ -296,7 +351,15 @@ cat <<EOF
   logs          journalctl --user -u $KIT_UNIT_NAME -f
   config        $KIT_ENV_FILE
   health check  camofox-doctor
+  capture       agent-capture doctor
 
   Restart your agent CLI so it picks up the new MCP server, then confirm the
   11 camofox_* tools are listed (in Claude Code: /mcp).
 EOF
+
+if [ -n "$CAPTURE_HINT" ]; then
+  echo
+  warn "screen capture is incomplete. To finish it, run:"
+  printf '    %s\n' "$CAPTURE_HINT"
+  info "then verify with: agent-capture doctor"
+fi

@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+#
+# agent-capture — screenshots and screen recording that work headless.
+#
+# Agents need to see and show their work. On a desktop that is easy; in a
+# headless dev container, CI runner or SSH session there is no screen to grab,
+# and every GUI-oriented tool fails. This wraps the three cases behind one
+# interface:
+#
+#   headed Wayland   grim / wf-recorder
+#   headed X11       ffmpeg x11grab
+#   HEADLESS         a virtual X display (Xvfb) + ffmpeg x11grab
+#
+# The headless path is the point: `agent-capture run` creates a throwaway
+# display, runs any GUI program inside it, records the whole session to video,
+# and tears it down. No physical screen, no compositor, no user logged in.
+#
+# Everything here is open source and packaged on Arch: ffmpeg, grim,
+# wf-recorder, xorg-server-xvfb, xdotool, imagemagick.
+#
+set -euo pipefail
+
+VERSION=0.1.0
+PROG=${0##*/}
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'
+else
+  R=''; B=''; D=''; RED=''; GRN=''; YEL=''; CYN=''
+fi
+say()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '%s  ✔%s %s\n' "$GRN" "$R" "$*" >&2; }
+bad()  { printf '%s  ✘%s %s\n' "$RED" "$R" "$*" >&2; }
+note() { printf '%s  ~%s %s\n' "$YEL" "$R" "$*" >&2; }
+dim()  { printf '%s%s%s\n' "$D" "$*" "$R" >&2; }
+die()  { printf '%serror%s %s\n' "$RED$B" "$R" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "$1 not found. $PROG doctor lists how to install it."; }
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/agent-capture"
+mkdir -p "$STATE_DIR"
+
+stamp() { date +%Y%m%d-%H%M%S; }
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+# Explicit --display always wins: it is how the caller says "grab that virtual
+# display", which must not be overridden by the compositor this shell happens
+# to be attached to.
+detect_backend() {
+  if [ -n "${AC_DISPLAY:-}" ]; then echo x11; return; fi
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && have grim; then echo wayland; return; fi
+  if [ -n "${DISPLAY:-}" ]; then echo x11; return; fi
+  echo none
+}
+
+x11_display() { printf '%s\n' "${AC_DISPLAY:-${DISPLAY:-}}"; }
+
+# On a Wayland compositor, Xwayland's root window is NOT the composited desktop —
+# grabbing it yields a black frame with a stray cursor. Verified on Hyprland.
+# Silence here is how an agent ends up reporting a successful screenshot of
+# nothing, so say it out loud.
+warn_xwayland() {
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${AC_DISPLAY:-}" ]; then
+    case "$AC_DISPLAY" in
+      :0|:0.0)
+        note "this is a Wayland session; grabbing $AC_DISPLAY captures Xwayland's root,"
+        note "not the real desktop — expect a black frame. Drop --display for grim,"
+        note "or use '$PROG run' for a virtual display you fully control."
+        ;;
+    esac
+  fi
+}
+
+# A capture that is a single flat colour is a failed render dressed up as a
+# success. Refuse to hand that back as if it worked.
+assert_not_blank() {
+  local f="$1" im="" sd=""
+  if have magick; then im=magick; elif have convert; then im=convert; else
+    dim "  (imagemagick absent — cannot verify the image is not blank)"
+    return 0
+  fi
+  sd="$("$im" "$f" -colorspace Gray -format '%[fx:standard_deviation]' info: 2>/dev/null || echo 1)"
+  # awk, because these are floats and the shell cannot compare them.
+  if awk -v v="$sd" 'BEGIN{exit !(v < 0.01)}' 2>/dev/null; then
+    bad "$f is essentially a flat image (std-dev $sd) — nothing was rendered"
+    note "on Wayland, X11 grabs of :0 look like this. See '$PROG doctor'."
+    return 1
+  fi
+  return 0
+}
+
+# Geometry of an X display, needed because ffmpeg x11grab requires an explicit
+# -video_size and silently grabs a wrong-sized region without it.
+x11_geometry() {
+  local disp="$1" geo=""
+  if have xdpyinfo; then
+    geo="$(DISPLAY="$disp" xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')"
+  fi
+  if [ -z "$geo" ] && have xrandr; then
+    geo="$(DISPLAY="$disp" xrandr 2>/dev/null | awk '/\*/{print $1; exit}')"
+  fi
+  printf '%s\n' "${geo:-1920x1080}"
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  printf '%s%s v%s%s\n\n' "$B" "$PROG" "$VERSION" "$R" >&2
+  printf '%sEnvironment%s\n' "$B" "$R" >&2
+  dim "  session   ${XDG_SESSION_TYPE:-unknown}   WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}   DISPLAY=${DISPLAY:-unset}"
+  dim "  backend   $(detect_backend)"
+
+  printf '\n%sHeaded Wayland%s\n' "$B" "$R" >&2
+  have grim && ok "grim — screenshots" || bad "grim missing (pacman -S grim)"
+  have wf-recorder && ok "wf-recorder — video" \
+    || { have wl-screenrec && ok "wl-screenrec — video" || note "no Wayland recorder (pacman -S wf-recorder)"; }
+  have slurp && ok "slurp — region select" || note "slurp missing (pacman -S slurp)"
+  have wtype && ok "wtype — keyboard input" || note "wtype missing (pacman -S wtype)"
+
+  printf '\n%sHeaded X11 / Xwayland%s\n' "$B" "$R" >&2
+  have ffmpeg && ok "ffmpeg — screenshots and video via x11grab" || bad "ffmpeg missing (pacman -S ffmpeg)"
+  have xdpyinfo && ok "xdpyinfo — display geometry" || note "xdpyinfo missing (pacman -S xorg-xdpyinfo) — geometry falls back to 1920x1080"
+
+  printf '\n%sHEADLESS (no screen at all)%s\n' "$B" "$R" >&2
+  if have Xvfb; then ok "Xvfb — virtual display"; else bad "Xvfb MISSING — headless capture cannot work (pacman -S xorg-server-xvfb)"; fi
+  have ffmpeg && ok "ffmpeg — records the virtual display" || bad "ffmpeg missing"
+  have xdotool && ok "xdotool — click/type inside the virtual display" || note "xdotool missing (pacman -S xdotool) — capture works, synthetic input does not"
+  have x11vnc && ok "x11vnc — watch a headless session live (optional)" || note "x11vnc missing (pacman -S x11vnc) — optional, for debugging"
+
+  printf '\n%sPost-processing%s\n' "$B" "$R" >&2
+  { have magick || have convert; } && ok "imagemagick — crop/annotate/GIF" || note "imagemagick missing (pacman -S imagemagick)"
+
+  printf '\n%sVerdict%s\n' "$B" "$R" >&2
+  local headed=0 headless=0
+  case "$(detect_backend)" in
+    wayland) { have grim; } && headed=1 ;;
+    x11)     { have ffmpeg; } && headed=1 ;;
+  esac
+  have Xvfb && have ffmpeg && headless=1
+  [ "$headed" = 1 ]  && ok "headed capture ready"   || bad "headed capture NOT ready"
+  [ "$headless" = 1 ] && ok "headless capture ready" || bad "headless capture NOT ready"
+  [ "$headed" = 1 ] || [ "$headless" = 1 ] || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# shot
+# ---------------------------------------------------------------------------
+cmd_shot() {
+  local out="" region=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--output) out="${2:?}"; shift ;;
+      --display) AC_DISPLAY="${2:?}"; shift ;;
+      --region) region=1 ;;
+      -h|--help) say "usage: $PROG shot [-o FILE] [--display :N] [--region]"; return 0 ;;
+      *) die "shot: unknown option $1" ;;
+    esac
+    shift
+  done
+  out="${out:-screenshot-$(stamp).png}"
+  mkdir -p "$(dirname "$out")"
+
+  case "$(detect_backend)" in
+    wayland)
+      need grim
+      if [ "$region" = 1 ]; then
+        need slurp
+        grim -g "$(slurp)" "$out"
+      else
+        grim "$out"
+      fi
+      ;;
+    x11)
+      need ffmpeg
+      warn_xwayland
+      local disp geo; disp="$(x11_display)"; geo="$(x11_geometry "$disp")"
+      [ "$region" = 1 ] && note "--region is Wayland-only; capturing the full display"
+      # -frames:v 1 turns the grabber into a stills camera.
+      ffmpeg -loglevel error -y -f x11grab -video_size "$geo" -i "$disp" -frames:v 1 "$out"
+      ;;
+    *)
+      die "no display. For a headless box use: $PROG run --shot $out -- <your gui command>"
+      ;;
+  esac
+
+  [ -s "$out" ] || die "capture produced no data: $out"
+  local blank=0
+  assert_not_blank "$out" || blank=1
+  printf '%s\n' "$out"
+  dim "  $(du -h "$out" | cut -f1)  backend=$(detect_backend)"
+  return "$blank"
+}
+
+# ---------------------------------------------------------------------------
+# rec — background recording with explicit start/stop
+# ---------------------------------------------------------------------------
+rec_pidfile="$STATE_DIR/rec.pid"
+rec_metafile="$STATE_DIR/rec.meta"
+
+rec_start() {
+  local out="" fps=30 format=mp4
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--output) out="${2:?}"; shift ;;
+      --fps) fps="${2:?}"; shift ;;
+      --display) AC_DISPLAY="${2:?}"; shift ;;
+      --format) format="${2:?}"; shift ;;
+      -h|--help) say "usage: $PROG rec start [-o FILE] [--fps N] [--format mp4|webm] [--display :N]"; return 0 ;;
+      *) die "rec start: unknown option $1" ;;
+    esac
+    shift
+  done
+
+  if [ -f "$rec_pidfile" ] && kill -0 "$(cat "$rec_pidfile")" 2>/dev/null; then
+    die "a recording is already running (pid $(cat "$rec_pidfile")). $PROG rec stop first."
+  fi
+
+  out="${out:-recording-$(stamp).$format}"
+  mkdir -p "$(dirname "$out")"
+  out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+
+  local backend; backend="$(detect_backend)"
+  case "$backend" in
+    wayland)
+      if have wf-recorder; then
+        wf-recorder -f "$out" -r "$fps" >"$STATE_DIR/rec.log" 2>&1 &
+      elif have wl-screenrec; then
+        wl-screenrec -f "$out" >"$STATE_DIR/rec.log" 2>&1 &
+      else
+        die "no Wayland recorder. Install wf-recorder, or record a virtual display with '$PROG run'."
+      fi
+      ;;
+    x11)
+      need ffmpeg
+      local disp geo; disp="$(x11_display)"; geo="$(x11_geometry "$disp")"
+      ffmpeg_record "$disp" "$geo" "$fps" "$format" "$out" &
+      ;;
+    *) die "no display to record. Use '$PROG run --record $out -- <command>' instead." ;;
+  esac
+
+  local pid=$!
+  echo "$pid" > "$rec_pidfile"
+  printf 'out=%s\nbackend=%s\nfps=%s\npid=%s\n' "$out" "$backend" "$fps" "$pid" > "$rec_metafile"
+
+  # Fail loudly and immediately rather than reporting success on a recorder that
+  # already died (wrong codec, unwritable path, missing display).
+  sleep 1.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$rec_pidfile"
+    say "$(tail -5 "$STATE_DIR/rec.log" 2>/dev/null)"
+    die "recorder exited immediately — see $STATE_DIR/rec.log"
+  fi
+
+  ok "recording → $out  (backend=$backend, ${fps}fps, pid=$pid)"
+  dim "  stop with: $PROG rec stop"
+}
+
+ffmpeg_record() {
+  local disp="$1" geo="$2" fps="$3" format="$4" out="$5"
+  local codec=(-c:v libx264 -preset ultrafast -pix_fmt yuv420p -movflags +faststart)
+  [ "$format" = webm ] && codec=(-c:v libvpx-vp9 -b:v 1M -pix_fmt yuv420p)
+  exec ffmpeg -loglevel warning -y \
+    -f x11grab -framerate "$fps" -video_size "$geo" -i "$disp" \
+    "${codec[@]}" "$out" >"$STATE_DIR/rec.log" 2>&1
+}
+
+rec_stop() {
+  [ -f "$rec_pidfile" ] || die "no recording in progress"
+  local pid; pid="$(cat "$rec_pidfile")"
+  local out; out="$(awk -F= '/^out=/{print $2}' "$rec_metafile" 2>/dev/null)"
+
+  if kill -0 "$pid" 2>/dev/null; then
+    # SIGINT, not SIGTERM: ffmpeg and wf-recorder both need to write their
+    # container trailer. Killed hard, the file is left unplayable.
+    kill -INT "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 15 ]; do sleep 0.5; waited=$((waited + 1)); done
+    kill -0 "$pid" 2>/dev/null && { note "recorder ignored SIGINT; forcing"; kill -9 "$pid" 2>/dev/null || true; }
+  else
+    note "recorder was already gone"
+  fi
+  rm -f "$rec_pidfile"
+
+  [ -n "$out" ] && [ -s "$out" ] || die "no output file produced (see $STATE_DIR/rec.log)"
+  printf '%s\n' "$out"
+  local dur="?"
+  have ffprobe && dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null | cut -d. -f1)s"
+  dim "  $(du -h "$out" | cut -f1)  duration=$dur"
+}
+
+rec_status() {
+  if [ -f "$rec_pidfile" ] && kill -0 "$(cat "$rec_pidfile")" 2>/dev/null; then
+    ok "recording (pid $(cat "$rec_pidfile"))"
+    [ -f "$rec_metafile" ] && cat "$rec_metafile" >&2
+    return 0
+  fi
+  dim "not recording"
+  return 1
+}
+
+cmd_rec() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    start) rec_start "$@" ;;
+    stop) rec_stop ;;
+    status) rec_status ;;
+    *) die "usage: $PROG rec {start|stop|status}" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# run — the headless path
+# ---------------------------------------------------------------------------
+free_display() {
+  local n=99
+  while [ -e "/tmp/.X11-unix/X$n" ] && [ "$n" -lt 200 ]; do n=$((n + 1)); done
+  echo ":$n"
+}
+
+cmd_run() {
+  local size=1280x800 record="" shot="" fps=25 settle=2 keep=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --size) size="${2:?}"; shift ;;
+      --record) record="${2:?}"; shift ;;
+      --shot) shot="${2:?}"; shift ;;
+      --fps) fps="${2:?}"; shift ;;
+      --settle) settle="${2:?}"; shift ;;
+      --keep) keep=1 ;;
+      --) shift; break ;;
+      -h|--help)
+        cat >&2 <<EOF
+usage: $PROG run [options] -- COMMAND [ARGS...]
+
+Creates a virtual X display, runs COMMAND inside it, and captures. Works with
+no screen, no compositor and no logged-in user.
+
+  --size WxH       virtual display size (default 1280x800)
+  --record FILE    record the whole session to video
+  --shot FILE      screenshot after --settle seconds
+  --fps N          recording framerate (default 25)
+  --settle N       seconds to wait before the screenshot (default 2)
+  --keep           leave the display running after COMMAND exits
+
+examples
+  $PROG run --shot page.png -- firefox --new-window https://example.com
+  $PROG run --record demo.mp4 --size 1920x1080 -- ./my-gui-app
+EOF
+        return 0 ;;
+      *) die "run: unknown option $1" ;;
+    esac
+    shift
+  done
+  [ $# -gt 0 ] || die "run: no command given (use -- COMMAND)"
+
+  need Xvfb
+  { [ -n "$record" ] || [ -n "$shot" ]; } && need ffmpeg
+
+  local disp; disp="$(free_display)"
+  local geo="${size%x*}x${size#*x}x24"
+
+  Xvfb "$disp" -screen 0 "$geo" -nolisten tcp >"$STATE_DIR/xvfb.log" 2>&1 &
+  local xvfb_pid=$!
+  local rec_pid="" cmd_pid=""
+
+  cleanup() {
+    [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null && { kill -INT "$rec_pid" 2>/dev/null || true; wait "$rec_pid" 2>/dev/null || true; }
+    [ -n "$cmd_pid" ] && kill -0 "$cmd_pid" 2>/dev/null && kill -TERM "$cmd_pid" 2>/dev/null
+    if [ "$keep" = 1 ]; then
+      note "leaving $disp up (Xvfb pid $xvfb_pid) — kill it yourself"
+    else
+      kill -0 "$xvfb_pid" 2>/dev/null && kill -TERM "$xvfb_pid" 2>/dev/null
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # Wait for the display socket instead of sleeping a guessed interval.
+  local waited=0
+  while [ ! -e "/tmp/.X11-unix/X${disp#:}" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  [ -e "/tmp/.X11-unix/X${disp#:}" ] || die "Xvfb failed to start — see $STATE_DIR/xvfb.log"
+  ok "virtual display $disp ($size)"
+
+  if [ -n "$record" ]; then
+    mkdir -p "$(dirname "$record")"
+    ( ffmpeg_record "$disp" "$size" "$fps" "${record##*.}" "$record" ) &
+    rec_pid=$!
+    sleep 1
+    kill -0 "$rec_pid" 2>/dev/null || { say "$(tail -5 "$STATE_DIR/rec.log")"; die "recorder failed to start"; }
+    ok "recording → $record"
+  fi
+
+  dim "  running: $*"
+  DISPLAY="$disp" "$@" &
+  cmd_pid=$!
+
+  if [ -n "$shot" ]; then
+    sleep "$settle"
+    mkdir -p "$(dirname "$shot")"
+    ffmpeg -loglevel error -y -f x11grab -video_size "$size" -i "$disp" -frames:v 1 "$shot"
+    if [ -s "$shot" ] && assert_not_blank "$shot"; then
+      ok "screenshot → $shot ($(du -h "$shot" | cut -f1))"
+    else
+      bad "screenshot captured nothing usable — did the command open a window? try --settle 5"
+    fi
+  fi
+
+  local status=0
+  wait "$cmd_pid" || status=$?
+  cmd_pid=""
+
+  if [ -n "$record" ]; then
+    kill -INT "$rec_pid" 2>/dev/null || true
+    wait "$rec_pid" 2>/dev/null || true
+    rec_pid=""
+    [ -s "$record" ] && ok "video → $record ($(du -h "$record" | cut -f1))" || bad "video empty — see $STATE_DIR/rec.log"
+  fi
+
+  return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# gif — because a PR comment cannot play an mp4
+# ---------------------------------------------------------------------------
+cmd_gif() {
+  local input="" out="" fps=12 width=800
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--output) out="${2:?}"; shift ;;
+      --fps) fps="${2:?}"; shift ;;
+      --width) width="${2:?}"; shift ;;
+      -h|--help) say "usage: $PROG gif INPUT [-o OUT] [--fps N] [--width N]"; return 0 ;;
+      *) input="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$input" ] || die "gif: no input video"
+  [ -f "$input" ] || die "gif: no such file: $input"
+  need ffmpeg
+  out="${out:-${input%.*}.gif}"
+  # Two passes: a per-clip palette beats the default web palette by a mile.
+  local palette; palette="$(mktemp "$STATE_DIR/palette-XXXXXX.png")"
+  ffmpeg -loglevel error -y -i "$input" -vf "fps=$fps,scale=$width:-1:flags=lanczos,palettegen" "$palette"
+  ffmpeg -loglevel error -y -i "$input" -i "$palette" \
+    -lavfi "fps=$fps,scale=$width:-1:flags=lanczos[x];[x][1:v]paletteuse" "$out"
+  rm -f "$palette"
+  printf '%s\n' "$out"
+  dim "  $(du -h "$out" | cut -f1)"
+}
+
+# ---------------------------------------------------------------------------
+usage() {
+  cat >&2 <<EOF
+${B}$PROG${R} v$VERSION — screenshots and screen recording that work headless
+
+  $PROG doctor                          what works in this environment
+  $PROG shot [-o FILE]                  screenshot the current screen
+  $PROG rec start [-o FILE]             start recording the current screen
+  $PROG rec stop                        stop and finalize the video
+  $PROG rec status                      is a recording running?
+  $PROG run [opts] -- CMD               ${B}headless${R}: virtual display + capture
+  $PROG gif VIDEO [-o OUT]              convert a recording to a GIF
+
+Run '$PROG <command> --help' for options, and '$PROG doctor' first.
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    doctor) cmd_doctor "$@" ;;
+    shot) cmd_shot "$@" ;;
+    rec) cmd_rec "$@" ;;
+    run) cmd_run "$@" ;;
+    gif) cmd_gif "$@" ;;
+    -V|--version) echo "$VERSION" ;;
+    ""|-h|--help) usage ;;
+    *) die "unknown command: $cmd (try '$PROG --help')" ;;
+  esac
+}
+main "$@"
