@@ -75,20 +75,37 @@ throwaway virtual display, runs your command inside it, captures, and cleans up:
 
 ```bash
 # screenshot a GUI app on a server with no monitor
-agent-capture run --shot out.png -- firefox --new-window https://example.com
+agent-capture run --shot out.png --timeout 25 -- \
+  firefox -no-remote -profile /tmp/prof https://example.com
 
 # record a whole session
-agent-capture run --record demo.mp4 --size 1920x1080 -- ./my-electron-app
+agent-capture run --record demo.mp4 --size 1920x1080 --timeout 30 -- ./my-electron-app
 
-# keep the display up to interact with it further
-agent-capture run --keep --size 1280x800 -- some-app
+# keep the display up to drive it with xdotool afterwards
+agent-capture run --keep --size 1280x800 --timeout 60 -- some-app
 ```
 
 No compositor, no logged-in user, no physical screen required. This is the
 answer to "there's no display on this machine".
 
 Options: `--size WxH` (default 1280x800), `--settle N` seconds before the
-screenshot (raise it when the app is slow to paint), `--fps N`, `--keep`.
+screenshot (raise it when the app is slow to paint), `--timeout N`, `--fps N`,
+`--keep`.
+
+**Always pass `--timeout` for anything that does not exit on its own** — a
+browser, an editor, a daemon. Without it `run` waits for the process forever.
+
+**Always use `run`, never `DISPLAY=:99 yourapp` by hand.** Setting `DISPLAY` is
+not enough to confine a program: anything Wayland-capable (Firefox, Chromium, any
+GTK4/Qt6 app) prefers `WAYLAND_DISPLAY` when it is set and connects to the host
+compositor instead — its windows then open **on the user's real desktop** while
+you capture an empty virtual display. This was observed: a Camoufox error dialog
+popped up on the user's screen out of nowhere. `run` strips the Wayland
+environment and forces the X11 backends so the app has nowhere else to go.
+
+Give browsers a **fresh profile** (`-no-remote -profile <dir>`) or they hand the
+URL to an already-running instance on the real desktop and exit — same escape by
+a different route. The profile directory must already exist.
 
 ## Gotchas that will waste your time
 
@@ -97,9 +114,18 @@ screenshot (raise it when the app is slow to paint), `--fps N`, `--keep`.
   get black plus a cursor. Verified on Hyprland. Drop `--display` so `grim`
   handles it, or use `run` for a display you control. `agent-capture` warns and
   fails on this instead of handing you the black frame.
-- **An empty screenshot from `run`.** The app had not painted yet. Raise
-  `--settle 5`. Some apps also need a window manager; if a window never maps,
-  install one (`openbox`, `i3`) and launch it inside the display first.
+- **An empty screenshot from `run`.** `run` reports how many windows exist on the
+  virtual display. **0 windows** means the app never drew there — it crashed on
+  startup, or it escaped to the host compositor (see the `run` notes above; check
+  the user's real screen for a stray dialog). **Windows but blank** means it had
+  not painted yet: raise `--settle 5`. Some apps also need a window manager; if a
+  window never maps, install one (`openbox`, `i3`) and launch it in the display
+  first.
+- **`Failed to select output, exiting` from a recording.** Multi-monitor Wayland:
+  `wf-recorder` asks on stdin which output to record and dies without a TTY.
+  `agent-capture` auto-detects the focused monitor; override with
+  `rec start --screen HDMI-A-1`. Get names from `hyprctl monitors` / `wlr-randr`.
+  A recording covers **one output**, not all of them.
 - **`Xvfb: command not found`.** `sudo pacman -S xorg-server-xvfb`. Without it
   there is no headless path at all — `doctor` says so plainly.
 - **Video is 0 bytes.** The recorder died at startup. Read

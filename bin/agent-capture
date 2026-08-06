@@ -93,6 +93,28 @@ assert_not_blank() {
   return 0
 }
 
+# Name of the Wayland output to record. With more than one monitor connected,
+# wf-recorder prompts on stdin for which output to use ("Enter output no.:") and
+# dies with "Failed to select output" when there is no TTY — which is every
+# agent-driven run. Resolve it up front, preferring the focused monitor.
+wayland_output() {
+  local name=""
+  if have hyprctl; then
+    name="$(hyprctl monitors -j 2>/dev/null \
+      | tr -d '\n' \
+      | grep -oE '"name": *"[^"]+"[^}]*"focused": *true' \
+      | grep -oE '"name": *"[^"]+"' | head -1 | cut -d'"' -f4)"
+    [ -n "$name" ] || name="$(hyprctl monitors 2>/dev/null | awk '/^Monitor /{print $2; exit}')"
+  fi
+  if [ -z "$name" ] && have swaymsg; then
+    name="$(swaymsg -t get_outputs 2>/dev/null | grep -oE '"name": *"[^"]+"' | head -1 | cut -d'"' -f4)"
+  fi
+  if [ -z "$name" ] && have wlr-randr; then
+    name="$(wlr-randr 2>/dev/null | awk 'NF && $0 !~ /^[[:space:]]/{print $1; exit}')"
+  fi
+  printf '%s\n' "$name"
+}
+
 # Geometry of an X display, needed because ffmpeg x11grab requires an explicit
 # -video_size and silently grabs a wrong-sized region without it.
 x11_geometry() {
@@ -204,14 +226,18 @@ rec_pidfile="$STATE_DIR/rec.pid"
 rec_metafile="$STATE_DIR/rec.meta"
 
 rec_start() {
-  local out="" fps=30 format=mp4
+  local out="" fps=30 format=mp4 output=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o|--output) out="${2:?}"; shift ;;
       --fps) fps="${2:?}"; shift ;;
       --display) AC_DISPLAY="${2:?}"; shift ;;
       --format) format="${2:?}"; shift ;;
-      -h|--help) say "usage: $PROG rec start [-o FILE] [--fps N] [--format mp4|webm] [--display :N]"; return 0 ;;
+      --screen) output="${2:?}"; shift ;;
+      -h|--help)
+        say "usage: $PROG rec start [-o FILE] [--fps N] [--format mp4|webm] [--display :N] [--screen NAME]"
+        say "       --screen picks which monitor on a multi-output Wayland session"
+        return 0 ;;
       *) die "rec start: unknown option $1" ;;
     esac
     shift
@@ -228,10 +254,22 @@ rec_start() {
   local backend; backend="$(detect_backend)"
   case "$backend" in
     wayland)
+      [ -n "$output" ] || output="$(wayland_output)"
       if have wf-recorder; then
-        wf-recorder -f "$out" -r "$fps" >"$STATE_DIR/rec.log" 2>&1 &
+        # </dev/null so a missing -o can never leave it blocked on an
+        # interactive output prompt; it fails fast instead of hanging.
+        if [ -n "$output" ]; then
+          wf-recorder -o "$output" -f "$out" -r "$fps" >"$STATE_DIR/rec.log" 2>&1 </dev/null &
+        else
+          note "could not detect an output name; letting wf-recorder choose"
+          wf-recorder -f "$out" -r "$fps" >"$STATE_DIR/rec.log" 2>&1 </dev/null &
+        fi
       elif have wl-screenrec; then
-        wl-screenrec -f "$out" >"$STATE_DIR/rec.log" 2>&1 &
+        if [ -n "$output" ]; then
+          wl-screenrec -o "$output" -f "$out" >"$STATE_DIR/rec.log" 2>&1 </dev/null &
+        else
+          wl-screenrec -f "$out" >"$STATE_DIR/rec.log" 2>&1 </dev/null &
+        fi
       else
         die "no Wayland recorder. Install wf-recorder, or record a virtual display with '$PROG run'."
       fi
@@ -323,8 +361,32 @@ free_display() {
   echo ":$n"
 }
 
+# Setting DISPLAY is NOT enough to confine a program to a virtual display.
+# Anything Wayland-capable — Firefox, Chromium, any GTK4/Qt6 app — prefers
+# WAYLAND_DISPLAY when it is set and connects to the host compositor instead,
+# so its windows pop up on the user's real screen. Observed exactly that: a
+# Camoufox error dialog appeared on the desktop while `run` sat there capturing
+# an empty virtual display. Strip the Wayland environment and force the X11
+# backends so the child has nowhere else to go.
+run_in_display() {
+  local disp="$1"; shift
+  env -u WAYLAND_DISPLAY -u MOZ_ENABLE_WAYLAND -u QT_QPA_PLATFORM -u GDK_BACKEND \
+      -u XDG_SESSION_TYPE -u WAYLAND_SOCKET \
+      DISPLAY="$disp" GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb MOZ_ENABLE_WAYLAND=0 \
+      "$@"
+}
+
+# How many windows exist on a display. Zero after the app should have painted
+# means it never drew here — usually because it escaped to the host compositor,
+# or it crashed on startup.
+virtual_windows() {
+  local disp="$1"
+  have xdotool || { echo unknown; return; }
+  DISPLAY="$disp" xdotool search --name '.*' 2>/dev/null | wc -l
+}
+
 cmd_run() {
-  local size=1280x800 record="" shot="" fps=25 settle=2 keep=0
+  local size=1280x800 record="" shot="" fps=25 settle=2 keep=0 timeout=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --size) size="${2:?}"; shift ;;
@@ -332,6 +394,7 @@ cmd_run() {
       --shot) shot="${2:?}"; shift ;;
       --fps) fps="${2:?}"; shift ;;
       --settle) settle="${2:?}"; shift ;;
+      --timeout) timeout="${2:?}"; shift ;;
       --keep) keep=1 ;;
       --) shift; break ;;
       -h|--help)
@@ -346,11 +409,17 @@ no screen, no compositor and no logged-in user.
   --shot FILE      screenshot after --settle seconds
   --fps N          recording framerate (default 25)
   --settle N       seconds to wait before the screenshot (default 2)
+  --timeout N      kill COMMAND after N seconds. Required for anything that
+                   never exits on its own — a browser, an editor, a daemon —
+                   otherwise run waits forever.
   --keep           leave the display running after COMMAND exits
 
+The child runs with WAYLAND_DISPLAY stripped and the X11 backends forced, so a
+Wayland-capable app cannot escape to your real desktop.
+
 examples
-  $PROG run --shot page.png -- firefox --new-window https://example.com
-  $PROG run --record demo.mp4 --size 1920x1080 -- ./my-gui-app
+  $PROG run --shot page.png --timeout 20 -- firefox --new-window https://example.com
+  $PROG run --record demo.mp4 --size 1920x1080 --timeout 30 -- ./my-gui-app
 EOF
         return 0 ;;
       *) die "run: unknown option $1" ;;
@@ -362,20 +431,33 @@ EOF
   need Xvfb
   { [ -n "$record" ] || [ -n "$shot" ]; } && need ffmpeg
 
-  local disp; disp="$(free_display)"
+  # These are deliberately NOT `local`. cleanup() runs from an EXIT trap, by
+  # which point cmd_run's locals are out of scope — under `set -u` that aborts
+  # the cleanup itself and orphans Xvfb, the recorder and the app.
+  AC_RUN_DISP="$(free_display)"
+  AC_RUN_KEEP="$keep"
+  AC_RUN_XVFB_PID=""
+  AC_RUN_REC_PID=""
+  AC_RUN_CMD_PID=""
+
+  local disp="$AC_RUN_DISP"
   local geo="${size%x*}x${size#*x}x24"
 
   Xvfb "$disp" -screen 0 "$geo" -nolisten tcp >"$STATE_DIR/xvfb.log" 2>&1 &
-  local xvfb_pid=$!
-  local rec_pid="" cmd_pid=""
+  AC_RUN_XVFB_PID=$!
 
   cleanup() {
-    [ -n "$rec_pid" ] && kill -0 "$rec_pid" 2>/dev/null && { kill -INT "$rec_pid" 2>/dev/null || true; wait "$rec_pid" 2>/dev/null || true; }
-    [ -n "$cmd_pid" ] && kill -0 "$cmd_pid" 2>/dev/null && kill -TERM "$cmd_pid" 2>/dev/null
-    if [ "$keep" = 1 ]; then
-      note "leaving $disp up (Xvfb pid $xvfb_pid) — kill it yourself"
-    else
-      kill -0 "$xvfb_pid" 2>/dev/null && kill -TERM "$xvfb_pid" 2>/dev/null
+    if [ -n "$AC_RUN_REC_PID" ] && kill -0 "$AC_RUN_REC_PID" 2>/dev/null; then
+      kill -INT "$AC_RUN_REC_PID" 2>/dev/null || true
+      wait "$AC_RUN_REC_PID" 2>/dev/null || true
+    fi
+    if [ -n "$AC_RUN_CMD_PID" ] && kill -0 "$AC_RUN_CMD_PID" 2>/dev/null; then
+      kill -TERM "$AC_RUN_CMD_PID" 2>/dev/null || true
+    fi
+    if [ "$AC_RUN_KEEP" = 1 ]; then
+      note "leaving $AC_RUN_DISP up (Xvfb pid $AC_RUN_XVFB_PID) — kill it yourself"
+    elif [ -n "$AC_RUN_XVFB_PID" ] && kill -0 "$AC_RUN_XVFB_PID" 2>/dev/null; then
+      kill -TERM "$AC_RUN_XVFB_PID" 2>/dev/null || true
     fi
   }
   trap cleanup EXIT INT TERM
@@ -389,35 +471,55 @@ EOF
   if [ -n "$record" ]; then
     mkdir -p "$(dirname "$record")"
     ( ffmpeg_record "$disp" "$size" "$fps" "${record##*.}" "$record" ) &
-    rec_pid=$!
+    AC_RUN_REC_PID=$!
     sleep 1
-    kill -0 "$rec_pid" 2>/dev/null || { say "$(tail -5 "$STATE_DIR/rec.log")"; die "recorder failed to start"; }
+    kill -0 "$AC_RUN_REC_PID" 2>/dev/null || { say "$(tail -5 "$STATE_DIR/rec.log")"; die "recorder failed to start"; }
     ok "recording → $record"
   fi
 
   dim "  running: $*"
-  DISPLAY="$disp" "$@" &
-  cmd_pid=$!
+  run_in_display "$disp" "$@" &
+  AC_RUN_CMD_PID=$!
+
+  # Anything that never exits on its own would hang `wait` forever. Reaping it
+  # after --timeout is what makes the screenshot workflow usable with a browser.
+  local killer_pid=""
+  if [ "$timeout" -gt 0 ] 2>/dev/null; then
+    ( sleep "$timeout"; kill -TERM "$AC_RUN_CMD_PID" 2>/dev/null ) &
+    killer_pid=$!
+    dim "  will stop it after ${timeout}s"
+  fi
 
   if [ -n "$shot" ]; then
     sleep "$settle"
+    local wins; wins="$(virtual_windows "$disp")"
+    dim "  windows on $disp: $wins"
     mkdir -p "$(dirname "$shot")"
     ffmpeg -loglevel error -y -f x11grab -video_size "$size" -i "$disp" -frames:v 1 "$shot"
     if [ -s "$shot" ] && assert_not_blank "$shot"; then
       ok "screenshot → $shot ($(du -h "$shot" | cut -f1))"
     else
-      bad "screenshot captured nothing usable — did the command open a window? try --settle 5"
+      bad "screenshot captured nothing usable"
+      if [ "$wins" = "0" ]; then
+        note "no window on $disp — the app never drew here. Either it crashed on"
+        note "startup (check its own output above), or it reached the host"
+        note "compositor instead. Run '$PROG doctor' and check for an error dialog"
+        note "on your real screen."
+      else
+        note "$wins window(s) exist but painted nothing yet — raise --settle"
+      fi
     fi
   fi
 
   local status=0
-  wait "$cmd_pid" || status=$?
-  cmd_pid=""
+  wait "$AC_RUN_CMD_PID" || status=$?
+  AC_RUN_CMD_PID=""
+  [ -n "$killer_pid" ] && kill "$killer_pid" 2>/dev/null || true
 
   if [ -n "$record" ]; then
-    kill -INT "$rec_pid" 2>/dev/null || true
-    wait "$rec_pid" 2>/dev/null || true
-    rec_pid=""
+    kill -INT "$AC_RUN_REC_PID" 2>/dev/null || true
+    wait "$AC_RUN_REC_PID" 2>/dev/null || true
+    AC_RUN_REC_PID=""
     [ -s "$record" ] && ok "video → $record ($(du -h "$record" | cut -f1))" || bad "video empty — see $STATE_DIR/rec.log"
   fi
 
