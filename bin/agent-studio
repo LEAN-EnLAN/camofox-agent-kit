@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+#
+# agent-studio — run browser capture inside a container that cannot touch your desktop.
+#
+# `agent-capture` runs Xvfb on the host. That is fine for a headless server, but
+# on a live desktop it puts an X server into the same namespace as your
+# compositor, and X display allocation is not as safe as it looks:
+#
+#   A display number is claimed in THREE places — the filesystem socket
+#   (/tmp/.X11-unix/X<n>), the lock file (/tmp/.X<n>-lock), and the Linux
+#   ABSTRACT-namespace socket (@/tmp/.X11-unix/X<n>). wlroots compositors start
+#   Xwayland with -listenfd and hold only the filesystem socket, leaving the
+#   abstract one unclaimed. An Xvfb hunting for a free display binds it, decides
+#   :0 is free, and takes the display. Every X11 client then reaches a software
+#   Xvfb instead of the GPU-backed Xwayland — games and accelerated apps
+#   included. This was observed, not theorised.
+#
+# A container ends the whole class of problem: private mount namespace (own
+# /tmp) plus private network namespace (own abstract socket namespace). The
+# display size is also fixed by the image, so recordings do not change when you
+# plug in a monitor.
+#
+# THE ONE FLAG THAT MUST NEVER BE ADDED: --network=host. Abstract sockets are
+# scoped to the NETWORK namespace, not the mount namespace. Host networking
+# reintroduces the exact collision this exists to prevent, and this script
+# refuses to do it.
+#
+set -euo pipefail
+
+PROG=${0##*/}
+IMAGE="${AGENT_STUDIO_IMAGE:-agent-studio:latest}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+else
+  R=''; B=''; D=''; RED=''; GRN=''; YEL=''
+fi
+log()  { printf '%s==>%s %s\n' "$B" "$R" "$*" >&2; }
+ok()   { printf '%s  ✔%s %s\n' "$GRN" "$R" "$*" >&2; }
+note() { printf '%s  ~%s %s\n' "$YEL" "$R" "$*" >&2; }
+die()  { printf '%serror%s %s\n' "$RED$B" "$R" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+runtime() {
+  # podman first: rootless by default, no daemon, and its user namespace makes
+  # the isolation argument stronger. docker is the common fallback.
+  if have podman; then echo podman
+  elif have docker; then echo docker
+  else die "neither podman nor docker found"; fi
+}
+
+# The isolation contract, in one place so it cannot drift between subcommands.
+# Every one of these is load-bearing:
+#   --network=none   private abstract-socket namespace (the actual fix) and no
+#                    outbound access it does not need for a local page. Callers
+#                    that need the internet pass --net bridge explicitly.
+#   --ipc=private    no shared SysV/POSIX IPC with the host
+#   --cap-drop=ALL   nothing in here needs a capability
+#   --security-opt no-new-privileges
+#   --user           artifacts on the bind mount belong to you, not root
+isolation_args() {
+  local net="$1"
+  printf '%s\n' \
+    "--network=$net" \
+    "--ipc=private" \
+    "--cap-drop=ALL" \
+    "--security-opt=no-new-privileges" \
+    "--user=$(id -u):$(id -g)" \
+    "--rm"
+}
+
+assert_no_host_net() {
+  for a in "$@"; do
+    case "$a" in
+      --network=host|--net=host|host)
+        die "refusing --network=host: abstract X sockets are scoped to the network namespace, so host networking reintroduces the display-:0 hijack this tool exists to prevent" ;;
+    esac
+  done
+}
+
+cmd_build() {
+  local with_camoufox=0 extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --with-camoufox) with_camoufox=1 ;;
+      --no-cache) extra+=(--no-cache) ;;
+      -h|--help) echo "usage: $PROG build [--with-camoufox] [--no-cache]"; return 0 ;;
+      *) die "build: unknown option $1" ;;
+    esac
+    shift
+  done
+  [ -f "$REPO_DIR/docker/Dockerfile" ] || die "no Dockerfile at $REPO_DIR/docker/Dockerfile"
+
+  # The build context is docker/, so tools/ is staged in rather than widening the
+  # context to the whole repo (which would ship .git and 200MB of artifacts).
+  local ctx; ctx="$(mktemp -d)"
+  trap 'rm -rf "$ctx"' RETURN
+  cp "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker/entrypoint.sh" "$ctx/"
+  mkdir -p "$ctx/tools"
+  [ -d "$REPO_DIR/tools" ] && cp -r "$REPO_DIR/tools/." "$ctx/tools/" 2>/dev/null || true
+
+  log "building $IMAGE (camoufox=$with_camoufox)"
+  "$(runtime)" build "${extra[@]}" \
+    --build-arg "WITH_CAMOUFOX=$with_camoufox" \
+    -t "$IMAGE" "$ctx"
+  ok "built $IMAGE"
+}
+
+cmd_doctor() {
+  local rt; rt="$(runtime)"
+  log "host"
+  printf '  runtime     %s\n' "$(command -v "$rt")"
+  if ! "$rt" info >/dev/null 2>&1; then
+    die "$rt is installed but not usable by this user (daemon down, or you are not in the '$rt' group)"
+  fi
+  ok "$rt usable without sudo"
+  if "$rt" image inspect "$IMAGE" >/dev/null 2>&1; then
+    ok "image $IMAGE present ($("$rt" image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1024/1024}'))"
+  else
+    note "image $IMAGE not built yet — run: $PROG build"
+    return 1
+  fi
+
+  log "host display safety"
+  local before; before="$(host_display_fingerprint)"
+  printf '  DISPLAY=:0  %s\n' "$before"
+
+  log "container"
+  # shellcheck disable=SC2046
+  "$rt" run $(isolation_args none) "$IMAGE" doctor
+
+  log "host display after container run"
+  local after; after="$(host_display_fingerprint)"
+  printf '  DISPLAY=:0  %s\n' "$after"
+  if [ "$before" = "$after" ]; then
+    ok "host display untouched by the container"
+  else
+    die "HOST DISPLAY CHANGED ($before -> $after) — isolation is broken, do not use this"
+  fi
+}
+
+# What the host's :0 looks like, so a run can be proven not to have disturbed it.
+host_display_fingerprint() {
+  have xdpyinfo || { echo "(xdpyinfo not installed)"; return 0; }
+  local geo=""
+  # Captured rather than piped straight to the caller: under `set -o pipefail` a
+  # non-zero xdpyinfo (it warns on some extensions) would trigger a fallback that
+  # prints a SECOND line, and the comparison would then never match itself.
+  geo="$(DISPLAY=:0 xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')" || true
+  printf '%s\n' "${geo:-unknown}"
+}
+
+cmd_run() {
+  local out="./studio-out" net=none verb="" screen="" duration="" settle="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out="${2:?}"; shift ;;
+      --screen) screen="${2:?}"; shift ;;
+      --duration) duration="${2:?}"; shift ;;
+      --settle) settle="${2:?}"; shift ;;
+      --net) net="${2:?}"; assert_no_host_net "$net"; shift ;;
+      -h|--help)
+        cat >&2 <<EOF
+usage: $PROG run [options] <verb> [args...]
+
+  verbs   doctor | shot <url> [outfile] | record <url> [outfile] | exec <cmd...>
+
+  --out DIR        host directory to receive artifacts (default ./studio-out)
+  --screen WxH     virtual display size, independent of your monitors
+  --duration N     seconds to record (record verb)
+  --settle N       seconds to wait before a screenshot (shot verb)
+  --net MODE       container network: none (default) or bridge for internet.
+                   'host' is refused — it breaks the display isolation.
+
+examples
+  $PROG run --net bridge --screen 1920x1080 shot https://example.com page.png
+  $PROG run --net bridge --duration 25 record https://example.com demo.mp4
+EOF
+        return 0 ;;
+      --) shift; args+=("$@"); break ;;
+      -*) die "run: unknown option $1" ;;
+      *) verb="$1"; shift; args+=("$@"); break ;;
+    esac
+    shift
+  done
+  [ -n "$verb" ] || die "run: no verb given (try --help)"
+  assert_no_host_net "$net"
+
+  mkdir -p "$out"
+  out="$(cd "$out" && pwd)"
+
+  local rt; rt="$(runtime)"
+  local envs=()
+  [ -n "$screen" ] && envs+=(-e "SCREEN=$screen")
+  [ -n "$duration" ] && envs+=(-e "DURATION=$duration")
+  [ -n "$settle" ] && envs+=(-e "SETTLE=$settle")
+
+  local before; before="$(host_display_fingerprint)"
+
+  log "running '$verb' in $IMAGE (net=$net, out=$out)"
+  # shellcheck disable=SC2046
+  "$rt" run $(isolation_args "$net") \
+    -v "$out:/out" \
+    "${envs[@]}" \
+    "$IMAGE" "$verb" "${args[@]}"
+  local rc=$?
+
+  # Non-negotiable post-condition. If a change to the run flags ever lets the
+  # container reach the host's X server, this is what catches it.
+  local after; after="$(host_display_fingerprint)"
+  if [ "$before" != "$after" ]; then
+    die "HOST DISPLAY CHANGED ($before -> $after) — the container escaped its namespace"
+  fi
+  ok "host display unchanged ($after)"
+
+  log "artifacts in $out"
+  ls -la "$out" | tail -n +2 | sed 's/^/  /' >&2
+  return $rc
+}
+
+usage() {
+  cat >&2 <<EOF
+${B}$PROG${R} — containerised browser capture that cannot disturb your desktop
+
+  $PROG build [--with-camoufox]   build the image
+  $PROG doctor                    check the runtime, image and isolation
+  $PROG run [opts] <verb> ...     run a capture (see: $PROG run --help)
+
+Everything happens inside a container with its own mount and network
+namespaces, so its X display can never collide with your compositor's :0.
+EOF
+}
+
+case "${1:-}" in
+  build) shift; cmd_build "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  ""|-h|--help) usage ;;
+  *) die "unknown command: $1" ;;
+esac

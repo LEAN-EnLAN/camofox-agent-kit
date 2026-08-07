@@ -355,10 +355,37 @@ cmd_rec() {
 # ---------------------------------------------------------------------------
 # run — the headless path
 # ---------------------------------------------------------------------------
+# A display number is free only when ALL THREE of these are unclaimed:
+#   /tmp/.X11-unix/X<n>    the filesystem socket
+#   /tmp/.X<n>-lock        the X lock file
+#   @/tmp/.X11-unix/X<n>   the Linux ABSTRACT-namespace socket
+#
+# The third one is the one everybody forgets, and it is not academic. On this
+# machine, Hyprland starts Xwayland with -listenfd, giving it only the
+# FILESYSTEM socket for :0 — the abstract socket stays unclaimed. camoufox-js
+# then ran `Xvfb -displayfd 3`, whose probe bound the free abstract socket,
+# concluded :0 was available, and took the display. Linux X clients prefer the
+# abstract socket, so every X11 app on the machine — games included — was
+# suddenly talking to a 1280x720 software Xvfb instead of the real 5120x1080
+# Xwayland. The lock file existed the whole time and did not help.
+#
+# Range starts at 300 to stay clear of camofox-browser's own Xvfb shim, which
+# allocates from :100-:199.
+display_free() {
+  local n="$1"
+  [ -e "/tmp/.X11-unix/X$n" ] && return 1
+  [ -e "/tmp/.X$n-lock" ] && return 1
+  ss -xl 2>/dev/null | grep -qF "@/tmp/.X11-unix/X$n" && return 1
+  return 0
+}
+
 free_display() {
-  local n=99
-  while [ -e "/tmp/.X11-unix/X$n" ] && [ "$n" -lt 200 ]; do n=$((n + 1)); done
-  echo ":$n"
+  local n=300
+  while [ "$n" -lt 400 ]; do
+    display_free "$n" && { echo ":$n"; return 0; }
+    n=$((n + 1))
+  done
+  die "no free X display in :300-:399"
 }
 
 # Setting DISPLAY is NOT enough to confine a program to a virtual display.
