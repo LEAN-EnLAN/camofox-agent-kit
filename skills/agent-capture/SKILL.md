@@ -25,6 +25,42 @@ agent-capture doctor
 It prints what works here and the exact `pacman -S` line for anything missing.
 Run it before concluding that capture is impossible on a machine.
 
+## On a desktop machine, prefer `agent-studio` over `run`
+
+`agent-capture run` starts an X server **on the host**. On a headless box that is
+correct. On a machine with a live desktop it is not, and the reason is not
+theoretical:
+
+An X display number is claimed in three places — the filesystem socket
+(`/tmp/.X11-unix/X<n>`), the lock file (`/tmp/.X<n>-lock`), and the Linux
+**abstract-namespace socket** (`@/tmp/.X11-unix/X<n>`). wlroots compositors start
+Xwayland with `-listenfd`, holding only the filesystem socket. An Xvfb hunting
+for a free display binds the unclaimed abstract one, concludes `:0` is free, and
+takes the desktop's display. Every X11 client — games and GPU apps included —
+then talks to a software Xvfb. This happened on the machine this kit was built
+on: `DISPLAY=:0` went from 5120x1080 to 1280x720 until the Xvfb was killed.
+
+```bash
+agent-studio build                    # once
+agent-studio doctor                   # runtime + image + isolation check
+agent-studio run --net bridge --screen 1920x1080 shot https://example.com page.png
+agent-studio run --net bridge --duration 25 record https://example.com demo.mp4
+agent-studio run --view --net bridge serve https://example.com   # watch it live in a browser tab
+```
+
+The browser inside runs **headed** — real window, real chrome, openbox managing
+it — but on a display that exists only inside the container, so nothing appears
+on the user's screen. `WINDOW_MODE=windowed` plus `BACKDROP=#2b2d42` frames the
+window on a backdrop, which is the shape polished recordings want.
+
+It also works unchanged on **macOS and Windows**: the container carries its own
+Linux userspace and X server, and Docker Desktop runs it in a Linux VM. The
+host's display system is never involved on any platform.
+
+**Never pass `--net host`.** Abstract sockets are scoped to the network
+namespace, so host networking reintroduces the exact collision. `agent-studio`
+refuses it, and fingerprints the host display before and after every run.
+
 ## For a browser page, use camofox instead
 
 If the thing you want a picture of is a **web page**, use `camofox_screenshot`

@@ -24,13 +24,18 @@ die()  { bad "$*"; exit 1; }
 XVFB_PID=""
 REC_PID=""
 APP_PID=""
+WM_PID=""
+VNC_PID=""
+NOVNC_PID=""
 
 cleanup() {
   # SIGINT, never SIGKILL: ffmpeg has to write the container trailer or the mp4
   # is unplayable. Same for anything muxing on exit.
   [ -n "$REC_PID" ] && kill -0 "$REC_PID" 2>/dev/null && { kill -INT "$REC_PID" 2>/dev/null || true; wait "$REC_PID" 2>/dev/null || true; }
   [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null && kill -TERM "$APP_PID" 2>/dev/null || true
-  [ -n "$XVFB_PID" ] && kill -0 "$XVFB_PID" 2>/dev/null && kill -TERM "$XVFB_PID" 2>/dev/null || true
+  for p in "$NOVNC_PID" "$VNC_PID" "$WM_PID" "$XVFB_PID"; do
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && kill -TERM "$p" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT INT TERM
 
@@ -48,7 +53,39 @@ start_display() {
     sleep 0.1; waited=$((waited + 1))
   done
   [ -e "/tmp/.X11-unix/X${DISPLAY#:}" ] || { cat /tmp/xvfb.log >&2; die "Xvfb failed to start"; }
+  # A headed session with no window manager has no maximise, no decorations and
+  # no focus handling; dialogs land unmapped in a corner. openbox is ~2MB and
+  # makes the recording look like a real desktop instead of a floating widget.
+  if command -v openbox >/dev/null 2>&1; then
+    openbox --sm-disable >/tmp/openbox.log 2>&1 &
+    WM_PID=$!
+    sleep 0.6
+  fi
+
+  # The root window defaults to black, which reads as "something failed" in a
+  # recording. A flat neutral backdrop makes a windowed capture look deliberate
+  # and gives the post-processing something sane to composite against.
+  command -v xsetroot >/dev/null 2>&1 && xsetroot -solid "${BACKDROP:-#1e1e2e}" 2>/dev/null || true
   ok "virtual display $DISPLAY at ${SCREEN}x${DEPTH} (container-private)"
+
+  # Optional live viewer. Never on by default: it opens a port, and the whole
+  # point of this container is that nothing shows up uninvited.
+  if [ "${ENABLE_VNC:-0}" = "1" ]; then start_vnc; fi
+}
+
+start_vnc() {
+  command -v x11vnc >/dev/null 2>&1 || { bad "x11vnc not in image"; return 1; }
+  x11vnc -display "$DISPLAY" -forever -shared -nopw -quiet \
+         -rfbport "${VNC_PORT:-5900}" >/tmp/x11vnc.log 2>&1 &
+  VNC_PID=$!
+  if [ -d /usr/share/novnc ]; then
+    websockify --web=/usr/share/novnc "${NOVNC_PORT:-6080}" "localhost:${VNC_PORT:-5900}" \
+      >/tmp/novnc.log 2>&1 &
+    NOVNC_PID=$!
+    ok "live view: http://localhost:${NOVNC_PORT:-6080}/vnc.html (published port required)"
+  else
+    ok "VNC on :${VNC_PORT:-5900}"
+  fi
 }
 
 # A capture that is one flat colour is a failed render wearing a success badge.
@@ -67,6 +104,42 @@ resolve_out() {
     /*) printf '%s\n' "$1" ;;
     *)  printf '%s\n' "$OUT_DIR/$1" ;;
   esac
+}
+
+# Openbox maps a window at whatever size the app asks for, which leaves a
+# recording with an arbitrary border. Pin it: maximized fills the screen,
+# windowed insets it evenly so the backdrop frames it on purpose.
+place_window() {
+  command -v xdotool >/dev/null 2>&1 || return 0
+  local mode="${WINDOW_MODE:-maximized}" w h inset wid=""
+  w="${SCREEN%x*}"; h="${SCREEN#*x}"
+
+  # Match the BROWSER's class, never a wildcard. openbox creates dozens of
+  # internal frame/decoration windows with no WM_CLASS at all; a `search --class
+  # '.*' | tail -1` picks one of those, and resizing an openbox frame to
+  # fullscreen leaves the capture showing nothing but the backdrop. Observed
+  # exactly that: a 1440x900 screenshot of an empty desktop while Firefox was
+  # running fine underneath.
+  local attempt=0
+  while [ "$attempt" -lt 40 ]; do
+    wid="$(xdotool search --onlyvisible --class '(firefox|camoufox|Navigator)' 2>/dev/null | head -1)" || true
+    [ -n "$wid" ] && break
+    sleep 0.25
+    attempt=$((attempt + 1))
+  done
+  # Placement is cosmetic. If the window never turns up, capture anyway rather
+  # than failing the run over a nicety.
+  [ -n "$wid" ] || { bad "no browser window to place (capturing as-is)"; return 0; }
+
+  if [ "$mode" = "windowed" ]; then
+    inset="${WINDOW_INSET:-48}"
+    xdotool windowsize "$wid" $((w - inset * 2)) $((h - inset * 2)) 2>/dev/null || true
+    xdotool windowmove "$wid" "$inset" "$inset" 2>/dev/null || true
+  else
+    xdotool windowsize "$wid" "$w" "$h" 2>/dev/null || true
+    xdotool windowmove "$wid" 0 0 2>/dev/null || true
+  fi
+  xdotool windowactivate "$wid" 2>/dev/null || true
 }
 
 browser_cmd() {
@@ -106,6 +179,7 @@ verb_shot() {
   mapfile -t cmd < <(browser_cmd "$profile" "$url")
   "${cmd[@]}" >/tmp/browser.log 2>&1 &
   APP_PID=$!
+  place_window
   sleep "${SETTLE:-12}"
   ffmpeg -loglevel error -y -f x11grab -video_size "$SCREEN" -i "$DISPLAY" -frames:v 1 "$out"
   assert_not_blank "$out" || die "captured nothing — see /tmp/browser.log"
@@ -127,12 +201,27 @@ verb_record() {
   mapfile -t cmd < <(browser_cmd "$profile" "$url")
   "${cmd[@]}" >/tmp/browser.log 2>&1 &
   APP_PID=$!
+  place_window
   sleep "$secs"
   kill -INT "$REC_PID" 2>/dev/null || true
   wait "$REC_PID" 2>/dev/null || true
   REC_PID=""
   [ -s "$out" ] || die "no video produced — see /tmp/rec.log"
   ok "$out ($(du -h "$out" | cut -f1), ${secs}s @ ${FPS}fps)"
+}
+
+# Hold a headed session open so an agent can drive it over time, rather than
+# one-shot capture. Pairs with ENABLE_VNC=1 to watch what it is doing.
+verb_serve() {
+  local url="${1:-about:blank}"
+  local profile; profile="$(mktemp -d /tmp/prof.XXXXXX)"
+  start_display
+  mapfile -t cmd < <(browser_cmd "$profile" "$url")
+  "${cmd[@]}" >/tmp/browser.log 2>&1 &
+  APP_PID=$!
+  place_window
+  ok "headed session running; Ctrl-C or docker stop to end it"
+  wait "$APP_PID"
 }
 
 # Escape hatch: run any command against the container's display.
@@ -145,6 +234,7 @@ case "${1:-doctor}" in
   doctor) shift; verb_doctor "$@" ;;
   shot)   shift; verb_shot "$@" ;;
   record) shift; verb_record "$@" ;;
+  serve)  shift; verb_serve "$@" ;;
   exec)   shift; verb_exec "$@" ;;
-  *)      die "unknown verb: $1 (doctor|shot|record|exec)" ;;
+  *)      die "unknown verb: $1 (doctor|shot|record|serve|exec)" ;;
 esac

@@ -8,6 +8,8 @@
 #   3. installs and starts a systemd *user* service bound to loopback
 #   4. registers the MCP server in every agent host it finds
 #   5. installs the agent skill that tells agents to use it
+#   6. offers to import your browser's login cookies, so agents land on the
+#      sites you actually use already logged in
 #
 # Safe to re-run: every step is idempotent.
 #
@@ -28,8 +30,11 @@ DO_MCP=1
 DO_SKILL=1
 DO_DEPS=1
 DO_LINGER=1
+DO_COOKIES=1
 ALL_HOSTS=0
 MCP_ONLY=0
+COOKIE_BROWSERS=""
+COOKIE_EXCLUDE=""
 
 usage() {
   cat <<'EOF'
@@ -51,6 +56,10 @@ Options:
       --no-skill         Skip installing the agent skill
       --no-deps          Skip the pacman dependency check
       --no-linger        Don't offer to enable user lingering (skips a sudo call)
+      --no-cookies       Skip the browser cookie import entirely
+      --cookie-browser N Import from browser N instead of the most recently
+                         used one. Repeatable. See --list on the importer.
+      --cookie-exclude R Never import cookies whose host matches this regex
       --all-hosts        Write config for every known agent host, even ones
                          that are not installed
   -h, --help             Show this help
@@ -60,6 +69,11 @@ SECURITY
   every interface. This installer pins 127.0.0.1. If you widen --host, set
   --access-key too: an unauthenticated browser server on your LAN hands anyone
   your logged-in sessions.
+
+  The cookie import copies live session tokens out of your browser into
+  ~/.camofox/cookies/cookies.txt (mode 0600). Anything that can drive camofox
+  can then act as you on those sites. It is opt-in at the prompt, and
+  --cookie-exclude keeps chosen hosts out of it.
 EOF
 }
 
@@ -76,6 +90,9 @@ while [ $# -gt 0 ]; do
     --no-skill) DO_SKILL=0 ;;
     --no-deps) DO_DEPS=0 ;;
     --no-linger) DO_LINGER=0 ;;
+    --no-cookies) DO_COOKIES=0 ;;
+    --cookie-browser) COOKIE_BROWSERS="$COOKIE_BROWSERS ${2:?--cookie-browser needs a name}"; shift ;;
+    --cookie-exclude) COOKIE_EXCLUDE="${2:?--cookie-exclude needs a regex}"; shift ;;
     --all-hosts) ALL_HOSTS=1 ;;
     -h|--help) usage; exit 0 ;;
     *) err "unknown option: $1"; echo; usage; exit 2 ;;
@@ -90,6 +107,7 @@ BASE_URL="http://${BIND_HOST}:${PORT}"
 CORE_BIN_PATH=""
 MCP_BIN_PATH=""
 CAPTURE_HINT=""
+COOKIE_HINT=""
 
 printf '%s\n' "${C_BOLD}camofox-agent-kit${C_RESET} — installing for $(whoami) on $(uname -sr)"
 echo
@@ -341,6 +359,99 @@ install -Dm755 "$SCRIPT_DIR/bin/camofox-doctor" "$HOME/.local/bin/camofox-doctor
 ok "camofox-doctor → ~/.local/bin/camofox-doctor"
 install -Dm755 "$SCRIPT_DIR/bin/agent-capture" "$HOME/.local/bin/agent-capture"
 ok "agent-capture → ~/.local/bin/agent-capture"
+# Cross-platform containerised capture. Installed even without a container
+# runtime present: `agent-studio doctor` is how the user finds out they need one.
+install -Dm755 "$SCRIPT_DIR/bin/agent-studio" "$HOME/.local/bin/agent-studio"
+ok "agent-studio → ~/.local/bin/agent-studio"
+install -Dm755 "$SCRIPT_DIR/bin/camofox-import-cookies" "$HOME/.local/bin/camofox-import-cookies"
+ok "camofox-import-cookies → ~/.local/bin/camofox-import-cookies"
+
+# ---------------------------------------------------------------------------
+# 8. Browser session import
+# ---------------------------------------------------------------------------
+# Without this, agents hit a login wall on nearly every site worth automating
+# and the human has to log in again inside a browser they never see. With it,
+# camofox starts every session holding the same cookies the human's browser
+# holds.
+if [ "$DO_COOKIES" = "1" ]; then
+  log "Browser session"
+
+  if ! have sqlite3; then
+    warn "sqlite3 not found — the cookie importer needs it to read browser profiles"
+    if is_arch && confirm "Install sqlite with pacman now?"; then
+      pacman_install sqlite || warn "install it yourself: sudo pacman -S sqlite"
+    fi
+  fi
+
+  if ! have sqlite3; then
+    warn "skipping the cookie import until sqlite3 is available"
+    COOKIE_HINT="sudo pacman -S sqlite && camofox-import-cookies"
+  else
+    FOUND_BROWSERS="$("$HOME/.local/bin/camofox-import-cookies" --list 2>/dev/null | tail -n +2 || true)"
+    if [ -z "$FOUND_BROWSERS" ]; then
+      info "no supported browser profile found — nothing to import"
+      info "supported: Firefox, Zen, LibreWolf, Floorp, Waterfox, Chrome, Chromium, Brave, Edge, Vivaldi, Opera"
+    else
+      printf '%s\n' "$FOUND_BROWSERS" | while IFS= read -r line; do info "found $line"; done
+      warn "this copies live session tokens into ~/.camofox/cookies/cookies.txt (mode 0600)."
+      warn "anything that can drive camofox can then act as you on those sites."
+
+      if confirm "Import your browser logins so agents start authenticated?"; then
+        # Seed the config before the first run so a chosen --cookie-exclude also
+        # applies to every later timer-driven refresh, not just this one.
+        COOKIE_CONF="$KIT_CONFIG_DIR/cookie-import.conf"
+        if [ ! -f "$COOKIE_CONF" ]; then
+          cp "$SCRIPT_DIR/systemd/cookie-import.conf.example" "$COOKIE_CONF"
+          ok "wrote $COOKIE_CONF"
+        else
+          ok "keeping existing $COOKIE_CONF"
+        fi
+        chmod 600 "$COOKIE_CONF"
+
+        # Drop any existing definition (commented or live) and re-append.
+        # Deliberately not sed -i: these values are regexes that routinely
+        # contain the alternation bar, which would terminate any sed s|||
+        # expression early and corrupt the config.
+        set_conf_kv() {
+          local key="$1" value="$2" tmp
+          case "$value" in
+            *"'"*) warn "$key contains a single quote; not written to the config"; return 1 ;;
+          esac
+          tmp="$(mktemp)"
+          grep -vE "^#?${key}=" "$COOKIE_CONF" > "$tmp" 2>/dev/null || true
+          printf "%s='%s'\n" "$key" "$value" >> "$tmp"
+          cp "$tmp" "$COOKIE_CONF"
+          rm -f "$tmp"
+          chmod 600 "$COOKIE_CONF"
+          ok "$key set in $(basename "$COOKIE_CONF")"
+        }
+        # shellcheck disable=SC2086
+        [ -n "$COOKIE_BROWSERS" ] && set_conf_kv BROWSERS "$(echo $COOKIE_BROWSERS)"
+        [ -n "$COOKIE_EXCLUDE" ] && set_conf_kv EXCLUDE_HOST_REGEX "$COOKIE_EXCLUDE"
+
+        mkdir -p "$KIT_UNIT_DIR"
+        install -Dm644 "$SCRIPT_DIR/systemd/camofox-import-cookies.service" \
+          "$KIT_UNIT_DIR/camofox-import-cookies.service"
+        install -Dm644 "$SCRIPT_DIR/systemd/camofox-import-cookies.timer" \
+          "$KIT_UNIT_DIR/camofox-import-cookies.timer"
+        systemctl --user daemon-reload
+
+        # Import once now so the very next agent call is already authenticated,
+        # then hand the refresh to the timer. Cookies rotate; a one-shot import
+        # silently decays into logged-out sessions within days.
+        if "$HOME/.local/bin/camofox-import-cookies"; then
+          systemctl --user enable --now camofox-import-cookies.timer >/dev/null
+          ok "cookies imported; refreshing every 10 minutes"
+        else
+          warn "the first import failed — the timer was not enabled"
+          COOKIE_HINT="camofox-import-cookies --list"
+        fi
+      else
+        info "skipped. Run 'camofox-import-cookies' any time to do it later."
+      fi
+    fi
+  fi
+fi
 
 echo
 printf '%s\n' "${C_GREEN}${C_BOLD}Done.${C_RESET}"
@@ -352,6 +463,7 @@ cat <<EOF
   config        $KIT_ENV_FILE
   health check  camofox-doctor
   capture       agent-capture doctor
+  browser login camofox-import-cookies --list
 
   Restart your agent CLI so it picks up the new MCP server, then confirm the
   11 camofox_* tools are listed (in Claude Code: /mcp).
@@ -362,4 +474,10 @@ if [ -n "$CAPTURE_HINT" ]; then
   warn "screen capture is incomplete. To finish it, run:"
   printf '    %s\n' "$CAPTURE_HINT"
   info "then verify with: agent-capture doctor"
+fi
+
+if [ -n "$COOKIE_HINT" ]; then
+  echo
+  warn "agents will hit login walls until the cookie import runs. To finish it:"
+  printf '    %s\n' "$COOKIE_HINT"
 fi

@@ -32,6 +32,16 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       # virtual display + X utilities the capture pipeline queries
       xvfb x11-utils x11-xserver-utils xdotool \
+      # A window manager. The browser maps its own window without one, but with
+      # no WM there is no maximise, no decorations and no focus management, so
+      # anything with a dialog or a second window renders wrong. openbox is the
+      # cheapest thing that makes a HEADED session behave like a real desktop.
+      openbox \
+      # Opt-in live viewing of the container's display, so the session can be
+      # watched on demand without ever appearing on the host's screen. Reached
+      # through a browser, which is what makes it work identically on Windows
+      # and macOS where there is no X server to point a native viewer at.
+      x11vnc novnc websockify \
       # capture, encoding, GIF conversion
       ffmpeg \
       # programmatic image editing (crop / frame / annotate)
