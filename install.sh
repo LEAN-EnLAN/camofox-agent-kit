@@ -317,6 +317,22 @@ if [ "$DO_MCP" = "1" ]; then
   [ -n "$API_KEY" ] && REG_ARGS+=(--api-key "$API_KEY")
   [ "$ALL_HOSTS" = "1" ] && REG_ARGS+=(--all)
   node "$SCRIPT_DIR/lib/register-mcp.mjs" "${REG_ARGS[@]}"
+
+  # The navigator is a second MCP server: it turns the browser from something an
+  # agent can read into something an agent can operate, with obstacle escalation
+  # and a run journal. Its own deps live beside it.
+  NAV_DIR="$SCRIPT_DIR/tools/navigator"
+  if [ -f "$NAV_DIR/navigator-mcp.mjs" ]; then
+    if [ ! -d "$NAV_DIR/node_modules" ]; then
+      info "installing navigator dependencies (@modelcontextprotocol/sdk)"
+      (cd "$NAV_DIR" && npm install --no-audit --no-fund --silent) || warn "navigator deps failed; nav_* tools will not load"
+    fi
+    chmod +x "$NAV_DIR/navigator-mcp.mjs"
+    NAV_ARGS=(--name camofox-navigator --bin "$NAV_DIR/navigator-mcp.mjs" --base-url "$BASE_URL")
+    [ -n "$ACCESS_KEY" ] && NAV_ARGS+=(--access-key "$ACCESS_KEY")
+    [ "$ALL_HOSTS" = "1" ] && NAV_ARGS+=(--all)
+    node "$SCRIPT_DIR/lib/register-mcp.mjs" "${NAV_ARGS[@]}"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

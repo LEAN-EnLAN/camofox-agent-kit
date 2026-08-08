@@ -1,0 +1,10 @@
+{
+  "name": "@camofox-agent-kit/navigator-mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server that lets an agent navigate the web through camofox, with obstacle escalation, a run journal and a visible action trail",
+  "type": "module",
+  "private": true,
+  "bin": { "camofox-navigator-mcp": "./navigator-mcp.mjs" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.30.0" }
+}

@@ -20,6 +20,8 @@
 // the caller's tokens on something vision cannot fix, and stopping on the second
 // throws away a page that was one click from working.
 
+import { policyFor } from "./policy.mjs";
+
 // Runs in the page. Gathers signals only — the judgement happens in Node, where
 // it can be tested without a browser.
 export const PROBE_JS = `(() => {
@@ -134,7 +136,11 @@ const RULES = [
   },
   {
     class: "login_wall",
-    verdict: "stop",
+    // Deliberately NOT a fixed verdict. Whether an agent may sign in is the
+    // user's decision, so it resolves through policy: deny by default, ask or
+    // allow only if they said so explicitly. Hardcoding "stop" here would be
+    // substituting my judgement for theirs on their own accounts.
+    capability: "loginWalls",
     // A password field on a short page is a login wall. The same field inside a
     // long page is usually a sign-in box in a header, which is not a wall.
     match: (s) => s.widgets.passwordField > 0 && s.phrases.signIn && s.isShort,
@@ -146,6 +152,7 @@ const RULES = [
   },
   {
     class: "captcha_image",
+    capability: "captchas",
     verdict: "escalate_vision",
     match: (s) => s.widgets.imageGrid > 0,
     why: "an image-selection challenge is on screen",
@@ -155,6 +162,7 @@ const RULES = [
   },
   {
     class: "captcha_checkbox",
+    capability: "captchas",
     verdict: "escalate_vision",
     match: (s) =>
       s.widgets.recaptchaFrame > 0 || s.widgets.recaptchaDiv > 0 ||
@@ -210,17 +218,32 @@ const RULES = [
  * Classify the page from probe signals.
  * @returns {{class:string, verdict:'proceed'|'wait_retry'|'escalate_vision'|'stop', why:string, remedy:string, evidence:object}}
  */
-export function classify(signals, { interactiveCount = null } = {}) {
+export function classify(signals, { interactiveCount = null, policies = {} } = {}) {
   for (const rule of RULES) {
-    if (rule.match(signals)) {
-      return {
-        class: rule.class,
-        verdict: rule.verdict,
-        why: rule.why,
-        remedy: rule.remedy,
-        evidence: evidenceFor(rule.class, signals),
-      };
+    if (!rule.match(signals)) continue;
+
+    let verdict = rule.verdict;
+    let remedy = rule.remedy;
+    let policy = null;
+
+    if (rule.capability) {
+      policy = policyFor(rule.capability, policies[rule.capability]);
+      // deny -> stop outright. ask -> hand it to the caller to confirm with a
+      // human. allow -> let the rule's own verdict stand (vision, usually).
+      verdict = policy.mode === "deny" ? "stop"
+        : policy.mode === "ask" ? "ask_user"
+        : rule.verdict;
+      remedy = [policy.message, rule.remedy].filter(Boolean).join(" ");
     }
+
+    return {
+      class: rule.class,
+      verdict,
+      why: rule.why,
+      remedy,
+      policy: policy ? { capability: policy.name, mode: policy.mode, source: policy.source } : null,
+      evidence: evidenceFor(rule.class, signals),
+    };
   }
   // No obstacle matched, but a page with nothing to click is not navigable
   // either — and saying "clear" about it would send the caller looking for
