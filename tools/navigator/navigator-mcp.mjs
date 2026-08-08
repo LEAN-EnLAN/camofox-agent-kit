@@ -82,6 +82,31 @@ function renderState(s, { limit = 60 } = {}) {
   return lines.join("\n");
 }
 
+/**
+ * Wait for the document to finish loading before reading it.
+ *
+ * camofox returns from openTab as soon as navigation commits, which is well
+ * before a real page has rendered. Reading immediately produced
+ * "empty_page → wait_retry" on a page that was perfectly fine 400ms later —
+ * technically a correct verdict, and useless to the caller, who would have to
+ * poll for something the server can just wait for.
+ */
+async function settle(tabId, { timeoutMs = 10_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const ready = await camofox.evaluate(
+        tabId, USER_ID,
+        `(() => JSON.stringify({ r: document.readyState, len: (document.body?document.body.innerText:'').length }))()`,
+      );
+      const p = typeof ready === "string" ? JSON.parse(ready) : ready;
+      if (p.r === "complete" && p.len > 40) return true;
+    } catch { /* the page may be mid-navigation; try again */ }
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  return false;
+}
+
 async function observe(tabId, { highlight = false } = {}) {
   const entry = tabs.get(tabId);
   if (!entry) throw new Error(`unknown tabId ${tabId} — open one with nav_open`);
@@ -127,6 +152,23 @@ const TOOLS = [
         highlight: { type: "boolean", description: "Draw the numbered overlay (default false)" },
       },
       required: ["tabId"],
+    },
+  },
+  {
+    name: "nav_find",
+    description:
+      "Find an interactive element anywhere on the page by its text, scroll it into view, and return its index. " +
+      "Use this instead of scrolling blindly: the element list only covers what is on screen, so on a long page " +
+      "the link you want is usually not in it yet. Give the visible text of the link or button.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "string" },
+        text: { type: "string", description: "Text to match, e.g. \"Mob\". Matched case-insensitively." },
+        exact: { type: "boolean", description: "Require the whole label to match, not just contain it (default true)" },
+        nth: { type: "number", description: "Which match to take when several exist (0-based, default 0)" },
+      },
+      required: ["tabId", "text"],
     },
   },
   {
@@ -243,6 +285,7 @@ async function handle(name, args) {
         guard: new ProgressGuard({ stallLimit: 3, maxSteps: 40 }),
         elements: [], fingerprint: null, url: tab.url,
       });
+      await settle(tab.tabId);
       const s = await observe(tab.tabId, { highlight: !!args.highlight });
       return ok(
         [
@@ -260,17 +303,79 @@ async function handle(name, args) {
       return ok(renderState(s));
     }
 
+    case "nav_find": {
+      const entry = tabs.get(args.tabId);
+      if (!entry) return fail(`unknown tabId ${args.tabId}`);
+      const exact = args.exact !== false;
+      const nth = Number(args.nth) || 0;
+
+      // Search the WHOLE document, not the indexed slice: the point of this tool
+      // is to reach what the viewport-limited element list cannot see.
+      const found = await camofox.evaluate(args.tabId, USER_ID, `(() => {
+        const want = ${JSON.stringify(String(args.text).toLowerCase())};
+        const nodes = [...document.querySelectorAll('a,button,input,select,textarea,[role="button"],[role="link"]')];
+        const matches = nodes.filter(el => {
+          const t = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim().toLowerCase();
+          if (!t) return false;
+          return ${exact ? "t === want" : "t.includes(want)"};
+        }).filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+        if (!matches.length) return JSON.stringify({ found: 0 });
+        const el = matches[Math.min(${nth}, matches.length - 1)];
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return JSON.stringify({
+          found: matches.length,
+          tag: el.tagName.toLowerCase(),
+          text: (el.innerText || el.value || '').trim().slice(0, 80),
+          href: el.getAttribute('href') || undefined,
+        });
+      })()`);
+      const f = typeof found === "string" ? JSON.parse(found) : found;
+      if (!f.found) {
+        return fail(`no visible element whose text ${exact ? "is" : "contains"} ${JSON.stringify(args.text)}. ` +
+          `Try exact:false, or check the label in nav_state.`);
+      }
+
+      // Re-read AFTER scrolling: the element is now in the viewport, so it has
+      // an index the caller can act on.
+      const s = await observe(args.tabId, { highlight: false });
+      const el = s.elements.find((e) => {
+        const l = (e.label || "").trim().toLowerCase();
+        return exact ? l === String(args.text).toLowerCase() : l.includes(String(args.text).toLowerCase());
+      });
+      entry.journal.append("find", { text: args.text, matches: f.found, index: el?.i ?? null, href: f.href });
+      if (!el) {
+        return ok([`scrolled to "${f.text}" (${f.found} match${f.found > 1 ? "es" : ""}${f.href ? `, href ${f.href}` : ""}) ` +
+          `but it did not appear in the indexed list — it may be covered or non-interactive.`, ``, renderState(s)].join("\n"));
+      }
+      return ok([`found "${f.text}" → index [${el.i}] ${el.tag}${f.href ? `  href=${f.href}` : ""}  (${f.found} match${f.found > 1 ? "es" : ""})`, ``, renderState(s)].join("\n"));
+    }
+
     case "nav_act": {
       const entry = tabs.get(args.tabId);
       if (!entry) return fail(`unknown tabId ${args.tabId} — open one with nav_open`);
 
-      // An index from an older read points at whatever now occupies that number,
-      // so a stale click is a wrong click rather than a failed one. Catch it here.
-      const element = args.index != null ? entry.elements.find((e) => e.i === args.index) : null;
-      if (args.index != null && !element) {
+      // Coerce before comparing. A caller passing "31" instead of 31 is an
+      // ordinary JSON-typing slip, and strict equality turned it into a "stale
+      // index" error — a diagnosis that sends the reader off re-reading the page
+      // when the index was perfectly current. A misleading error costs more than
+      // a failure.
+      let index = null;
+      if (args.index != null) {
+        index = Number(args.index);
+        if (!Number.isFinite(index)) {
+          return fail(`index must be a number, got ${JSON.stringify(args.index)}`);
+        }
+      }
+      // A genuinely stale index points at whatever now occupies that number, so
+      // a stale click is a WRONG click rather than a failed one. Refuse it.
+      const element = index != null ? entry.elements.find((e) => e.i === index) : null;
+      if (index != null && !element) {
+        const range = entry.elements.length
+          ? `current indices run 0-${Math.max(...entry.elements.map((e) => e.i))}`
+          : `the last read found no interactive elements`;
         return fail(
-          `index ${args.index} is not in the last read of this tab (it had ${entry.elements.length} elements). ` +
-            `Call nav_state and use a current index — acting on a stale number clicks whatever now occupies it.`,
+          `index ${index} is not in the last read of this tab (${entry.elements.length} elements, ${range}). ` +
+            `Call nav_state or nav_find and use a current index — acting on a stale number clicks whatever now occupies it.`,
         );
       }
 
@@ -278,15 +383,15 @@ async function handle(name, args) {
       try {
         switch (args.action) {
           case "click": {
-            if (args.index == null) return fail("click needs an index");
+            if (index == null) return fail("click needs an index");
             // Mark the target before acting so a recording shows WHAT was clicked.
-            await camofox.evaluate(args.tabId, USER_ID, focusJs(args.index)).catch(() => {});
+            await camofox.evaluate(args.tabId, USER_ID, focusJs(index)).catch(() => {});
             // The actual click goes through the browser's input pipeline, not
             // page script, so hover-dependent UIs behave.
             const clickRes = await fetch(`${camofox.base}/tabs/${args.tabId}/click`, {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ userId: USER_ID, selector: selectorFor(args.index) }),
+              body: JSON.stringify({ userId: USER_ID, selector: selectorFor(index) }),
             });
             const clickText = await clickRes.text();
             if (!clickRes.ok) throw new Error(`click -> ${clickRes.status}: ${clickText.slice(0, 200)}`);
@@ -295,13 +400,13 @@ async function handle(name, args) {
             break;
           }
           case "type": {
-            if (args.index == null) return fail("type needs an index");
+            if (index == null) return fail("type needs an index");
             if (args.text == null) return fail("type needs text");
             const res = await fetch(`${camofox.base}/tabs/${args.tabId}/type`, {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({
-                userId: USER_ID, selector: selectorFor(args.index),
+                userId: USER_ID, selector: selectorFor(index),
                 text: args.text, pressEnter: !!args.pressEnter,
               }),
             });
@@ -343,17 +448,18 @@ async function handle(name, args) {
             return fail(`unknown action ${args.action}`);
         }
       } catch (e) {
-        entry.journal.action({ action: args.action, index: args.index, value: args.text, element, result: `error: ${e.message}` });
+        entry.journal.action({ action: args.action, index, value: args.text, element, result: `error: ${e.message}` });
         return fail(`${args.action} failed: ${e.message}`);
       }
 
-      // Let the page settle, then re-read: the caller needs the consequence of
-      // the action, not the state before it.
-      await new Promise((r) => setTimeout(r, 900));
+      // The caller needs the CONSEQUENCE of the action, not the state before it.
+      // A click that navigates needs the new document loaded before it is read.
+      await new Promise((r) => setTimeout(r, 500));
+      if (["click", "navigate", "back"].includes(args.action)) await settle(args.tabId, { timeoutMs: 12_000 });
       const s = await observe(args.tabId, { highlight: !!args.highlight });
 
       entry.journal.action({
-        action: args.action, index: args.index, value: args.text,
+        action: args.action, index, value: args.text,
         element, result, obstacle: s.obstacle,
       });
 
@@ -362,7 +468,7 @@ async function handle(name, args) {
       if (!progress.ok) notes.push(`⚠ ${progress.reason}`);
       if (element && isSecretField(element)) notes.push(`(value redacted in the journal — this looked like a secret field)`);
 
-      return ok([`${args.action} ok${args.index != null ? ` on [${args.index}] ${element?.label || ""}` : ""}`, ...notes, ``, renderState(s)].join("\n"));
+      return ok([`${args.action} ok${index != null ? ` on [${index}] ${element?.label || ""}` : ""}`, ...notes, ``, renderState(s)].join("\n"));
     }
 
     case "nav_look": {
