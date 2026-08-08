@@ -17,7 +17,7 @@
 //   node review.mjs http://127.0.0.1:4200 --routes /login,/register --out DIR
 //   node review.mjs http://127.0.0.1:4200 --routes-file routes.json
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { camofox } from "./lib/camofox.mjs";
 import { readState } from "./lib/dom.mjs";
@@ -34,6 +34,11 @@ const outDir = arg("--out", "./review-out");
 const expectedPrefixes = String(arg("--expect-fail", "/api")).split(",").filter(Boolean);
 const viewports = String(arg("--viewports", "1440x900,390x844")).split(",");
 const USER = "fe-review";
+// Optional client-side session seed. Guards in SPAs are usually a localStorage
+// check, so seeding one reaches the authenticated screens WITHOUT a backend —
+// which is the only way to review them when the API is deliberately absent.
+// It is a review fixture, not a login: no credentials are sent anywhere.
+const seedFile = arg("--seed-session", null);
 
 mkdirSync(outDir, { recursive: true });
 const parse = (raw) => (typeof raw === "string" ? JSON.parse(raw) : raw);
@@ -57,6 +62,17 @@ try {
     const url = `${base}${route}`;
     console.log(`\n── ${route}`);
     await camofox.navigate(tabId, USER, { url });
+    if (seedFile) {
+      // Written before the app reads it, then reloaded so the guard sees a
+      // session on boot rather than half-way through routing.
+      const seed = JSON.parse(readFileSync(seedFile, "utf8"));
+      await camofox.evaluate(tabId, USER, `(() => {
+        const s = ${JSON.stringify(seed)};
+        for (const [k, v] of Object.entries(s)) localStorage.setItem(k, typeof v === "string" ? v : JSON.stringify(v));
+        return JSON.stringify({ seeded: Object.keys(s) });
+      })()`);
+      await camofox.navigate(tabId, USER, { url });
+    }
     // Instrument AFTER the document exists but as early as possible. A full load
     // is unavoidable per route here; the SPA pass below is what catches errors
     // that only happen on in-app transitions.
