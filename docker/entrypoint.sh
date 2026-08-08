@@ -142,6 +142,33 @@ place_window() {
   xdotool windowactivate "$wid" 2>/dev/null || true
 }
 
+# Firefox's first-run chrome ruins a recording: a translation offer covers the
+# page, an "operating system security" notification bar eats a strip of the
+# viewport, and the privacy tab steals focus. Seed the profile so the capture
+# shows the site instead of the browser talking about itself.
+seed_profile() {
+  local profile="$1"
+  mkdir -p "$profile"
+  cat > "$profile/user.js" <<'PREFS'
+user_pref("browser.translations.automaticallyPopup", false);
+user_pref("browser.translations.enable", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("datareporting.policy.firstRunURL", "");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("browser.download.useDownloadDir", true);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("browser.contentblocking.report.hide_vpn_banner", true);
+user_pref("browser.privatebrowsing.vpnpromourl", "");
+user_pref("extensions.update.enabled", false);
+user_pref("app.update.auto", false);
+PREFS
+}
+
 browser_cmd() {
   # Prefer the bundled Camoufox when the image was built with it; fall back to
   # the stock Firefox that is always present.
@@ -175,6 +202,7 @@ verb_shot() {
   local url="${1:?usage: shot <url> [outfile]}" out
   out="$(resolve_out "${2:-shot.png}")"
   local profile; profile="$(mktemp -d /tmp/prof.XXXXXX)"
+  seed_profile "$profile"
   start_display
   mapfile -t cmd < <(browser_cmd "$profile" "$url")
   "${cmd[@]}" >/tmp/browser.log 2>&1 &
@@ -191,6 +219,7 @@ verb_record() {
   out="$(resolve_out "${2:-recording.mp4}")"
   local secs="${DURATION:-20}"
   local profile; profile="$(mktemp -d /tmp/prof.XXXXXX)"
+  seed_profile "$profile"
   start_display
   ffmpeg -loglevel warning -y -f x11grab -framerate "$FPS" -video_size "$SCREEN" -i "$DISPLAY" \
          -c:v libx264 -preset ultrafast -pix_fmt yuv420p -movflags +faststart "$out" \
@@ -215,6 +244,7 @@ verb_record() {
 verb_serve() {
   local url="${1:-about:blank}"
   local profile; profile="$(mktemp -d /tmp/prof.XXXXXX)"
+  seed_profile "$profile"
   start_display
   mapfile -t cmd < <(browser_cmd "$profile" "$url")
   "${cmd[@]}" >/tmp/browser.log 2>&1 &
